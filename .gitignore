@@ -1,0 +1,86 @@
+# =========================
+# Dataset
+# =========================
+data/
+data_camera/
+data_camera_cyl/
+fisheye_data_aug/
+fisheye_data_demo/
+fisheye_data_2w_frame/
+dataset_fisheye/
+vis/
+vis_pred_3d/
+git-apa-perception-mono3dod-t2/mono3DOD_Parking/mono3DOD_Parking_code/exp/ddd/default/
+git-apa-perception-mono3dod-t2/mono3DOD_Parking/mono3DOD_Parking_code/exp/
+# 图片、视频等原始数据
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.mp4
+*.avi
+*.zip
+
+# =========================
+# Model Weights / Checkpoints
+# =========================
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.weights
+
+checkpoints/
+weights/
+pretrained/
+
+# =========================
+# Logs
+# =========================
+logs/
+log/
+*.log
+runs/
+events.out.tfevents*
+
+# =========================
+# Debug / Temp
+# =========================
+debug/
+tmp/
+temp/
+*.tmp
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# IDE
+# =========================
+.idea/
+
+# =========================
+# System
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Conda / venv
+# =========================
+env/
+venv/
+.venv/
