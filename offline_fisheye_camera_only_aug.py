@@ -10,6 +10,7 @@ import json
 import math
 import shutil
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -24,35 +25,33 @@ METADATA_DIRS: Tuple[str, ...] = ("camera_config", "position", "result")
 LIDAR_MIRROR = np.diag([1.0, -1.0, 1.0, 1.0])
 CAMERA_X_MIRROR = np.diag([-1.0, 1.0, 1.0, 1.0])
 
-TARGET_TAIL_CLASSES = frozenset({"pedestrian", "bicycle", "motor"})
+TARGET_TAIL_CLASSES = frozenset({"pedestrian", "bicycle", "motor","stopper"})
 RARE_CLASSES = frozenset({"animal", "bus", "construction_vehicle", "traffic_cone"})
-TAIL_CLASSES = frozenset({"truck", "trash_bin", "sign", "barrier", "stopper"})
-TARGET_CLASS_WEIGHTS: Dict[str, float] = {
-    "pedestrian": 3.2,
-    "bicycle": 1.3,
-    "motor": 2.2,
-}
-TARGET_CLASS_BONUS: Dict[str, float] = {
-    "pedestrian": 1.4,
-    "bicycle": 0.5,
-    "motor": 1.0,
-}
-CAR_PENALTY_WEIGHT = 0.35
-NON_CAR_TAIL_BONUS = 0.15
-RARE_CLASS_BONUS = 0.25
-MIN_TARGET_AUGMENT_TIMES = 2
-MAX_TARGET_AUGMENT_TIMES = 6
-PEDESTRIAN_PRESENCE_BONUS = 2.2
-PEDESTRIAN_MIN_AUGMENT_TIMES = 4
-PEDESTRIAN_MAX_CAR_PENALTY = 1.4
-TARGET_SCORE_THRESHOLDS: Tuple[Tuple[float, int], ...] = (
-    (8.0, 6),
-    (5.5, 5),
-    (3.5, 4),
-    (1.5, 3),
-)
+TAIL_CLASSES = frozenset({"truck", "trash_bin", "sign", "barrier"})
+LONG_TAIL_CLASSES = RARE_CLASSES | TAIL_CLASSES
+PARALLEL_WORKERS = 40
+
+DEFAULT_TARGET_TOTAL_FRAMES = 150000
+BASE_TARGET_COLOR_ONLY_COPIES = 4
+BASE_LONG_TAIL_COLOR_ONLY_COPIES = 6
+BASE_TARGET_AND_LONG_TAIL_COLOR_ONLY_COPIES = 8
+TARGET_CLASS_COLOR_PRIORITY = 0.75
+LONG_TAIL_CLASS_COLOR_PRIORITY = 1.5
+PEDESTRIAN_COLOR_PRIORITY_BONUS = 0.75
+TARGET_AND_LONG_TAIL_PRIORITY_BONUS = 2.0
 VERY_LIGHT_PHOTO_CLASSES = frozenset({"bus", "animal", "construction_vehicle"})
 LIGHT_PHOTO_CLASSES = frozenset({"pedestrian", "bicycle", "motor", "traffic_cone"})
+COLOR_INTENSITY_CYCLES: Dict[str, Tuple[str, ...]] = {
+    "target_tail": ("light", "medium", "strong", "medium"),
+    "long_tail": ("medium", "strong", "xstrong", "strong"),
+    "target_and_long_tail": ("medium", "strong", "xstrong", "strong", "medium"),
+}
+PHOTO_INTENSITY_SCALES: Dict[str, Dict[str, float]] = {
+    "light": {"magnitude_scale": 0.85, "probability_scale": 0.90},
+    "medium": {"magnitude_scale": 1.0, "probability_scale": 1.0},
+    "strong": {"magnitude_scale": 1.35, "probability_scale": 1.15},
+    "xstrong": {"magnitude_scale": 1.70, "probability_scale": 1.30},
+}
 
 PHOTO_PROFILES: Dict[str, Dict[str, Any]] = {
     "very_light": {
@@ -219,14 +218,16 @@ CANONICAL_CLASS_MAP: Dict[str, str] = {
 
 @dataclass(frozen=True)
 class FrameDecision:
-    augment_times: int
     trigger: str
     profile: str
     canonical_classes: Tuple[str, ...]
     class_counts: Dict[str, int]
+    has_target_tail: bool
+    has_long_tail: bool
     target_tail_count: int
-    car_count: int
-    sampling_score: float
+    long_tail_count: int
+    base_color_only_count: int
+    color_priority: float
 
 
 def wrap_to_pi(angle: float) -> float:
@@ -252,6 +253,22 @@ def stable_rng(seed: int, *parts: str) -> np.random.Generator:
     digest = hashlib.sha1("|".join([str(seed), *parts]).encode("utf-8")).digest()
     child_seed = int.from_bytes(digest[:8], "little", signed=False)
     return np.random.default_rng(child_seed)
+
+
+def _collect_scene_frame_decisions_worker(
+    args: Tuple[Path, Optional[int]]
+) -> Tuple[Path, List[str], Dict[str, FrameDecision]]:
+    scene_dir, max_frames = args
+    frame_ids, frame_decisions = collect_scene_frame_decisions(
+        scene_dir, max_frames=max_frames
+    )
+    return scene_dir, frame_ids, frame_decisions
+
+
+def _run_single_scene_worker(
+    args: Tuple[Path, Path, int, bool, Optional[int], bool, Mapping[str, int]]
+) -> Dict[str, Any]:
+    return run_single_scene(*args)
 
 
 def ensure_output_root(
@@ -319,61 +336,52 @@ def collect_object_counts(label_data: Mapping[str, Any]) -> Counter[str]:
     return counts
 
 
-def decide_frame_augmentation(
-    label_data: Mapping[str, Any], seed: int, frame_id: str
-) -> Optional[FrameDecision]:
+def compute_base_color_only_count(has_target_tail: bool, has_long_tail: bool) -> int:
+    if has_target_tail and has_long_tail:
+        return BASE_TARGET_AND_LONG_TAIL_COLOR_ONLY_COPIES
+    if has_long_tail:
+        return BASE_LONG_TAIL_COLOR_ONLY_COPIES
+    if has_target_tail:
+        return BASE_TARGET_COLOR_ONLY_COPIES
+    return 0
+
+
+def compute_color_priority(
+    class_counts: Mapping[str, int], target_tail_count: int, long_tail_count: int
+) -> float:
+    has_target_tail = target_tail_count > 0
+    has_long_tail = long_tail_count > 0
+    priority = float(compute_base_color_only_count(has_target_tail, has_long_tail))
+    priority += float(target_tail_count) * TARGET_CLASS_COLOR_PRIORITY
+    priority += float(long_tail_count) * LONG_TAIL_CLASS_COLOR_PRIORITY
+    if class_counts.get("pedestrian", 0) > 0:
+        priority += PEDESTRIAN_COLOR_PRIORITY_BONUS
+    if has_target_tail and has_long_tail:
+        priority += TARGET_AND_LONG_TAIL_PRIORITY_BONUS
+    return priority
+
+
+def decide_frame_augmentation(label_data: Mapping[str, Any]) -> Optional[FrameDecision]:
     class_counts = collect_object_counts(label_data)
     if not class_counts:
         return None
 
     canonical_classes = sorted(class_counts)
     class_set = set(canonical_classes)
-    plan_rng = stable_rng(seed, frame_id, "plan")
-    pedestrian_count = class_counts.get("pedestrian", 0)
     target_tail_count = sum(class_counts.get(name, 0) for name in TARGET_TAIL_CLASSES)
-    car_count = class_counts.get("car", 0)
-    non_car_tail_count = sum(class_counts.get(name, 0) for name in TAIL_CLASSES)
-    rare_count = sum(class_counts.get(name, 0) for name in RARE_CLASSES)
+    long_tail_count = sum(class_counts.get(name, 0) for name in LONG_TAIL_CLASSES)
+    has_target_tail = target_tail_count > 0
+    has_long_tail = long_tail_count > 0
 
-    if target_tail_count > 0:
-        sampling_score = sum(
-            class_counts.get(name, 0) * weight
-            for name, weight in TARGET_CLASS_WEIGHTS.items()
-        )
-        sampling_score += sum(
-            TARGET_CLASS_BONUS[name]
-            for name in TARGET_TAIL_CLASSES
-            if class_counts.get(name, 0) > 0
-        )
-        sampling_score += non_car_tail_count * NON_CAR_TAIL_BONUS
-        sampling_score += rare_count * RARE_CLASS_BONUS
-        car_penalty = car_count * CAR_PENALTY_WEIGHT
-        if pedestrian_count > 0:
-            sampling_score += PEDESTRIAN_PRESENCE_BONUS
-            car_penalty = min(car_penalty, PEDESTRIAN_MAX_CAR_PENALTY)
-        sampling_score -= car_penalty
-        sampling_score += float(plan_rng.uniform(0.0, 0.35))
-        sampling_score = max(sampling_score, 0.0)
-
-        augment_times = MIN_TARGET_AUGMENT_TIMES
-        for threshold, times in TARGET_SCORE_THRESHOLDS:
-            if sampling_score >= threshold:
-                augment_times = times
-                break
-        if pedestrian_count > 0:
-            augment_times = max(augment_times, PEDESTRIAN_MIN_AUGMENT_TIMES)
-        augment_times = min(MAX_TARGET_AUGMENT_TIMES, augment_times)
-        trigger = "target_tail"
-    elif class_set & RARE_CLASSES:
-        augment_times = int(plan_rng.integers(3, 5))
-        trigger = "rare"
-        sampling_score = float(rare_count)
-    elif class_set & TAIL_CLASSES:
-        augment_times = 2
-        trigger = "tail"
-        sampling_score = float(non_car_tail_count)
-    else:
+    if not has_target_tail and not has_long_tail:
         return None
+
+    if has_target_tail and has_long_tail:
+        trigger = "target_and_long_tail"
+    elif has_long_tail:
+        trigger = "long_tail"
+    else:
+        trigger = "target_tail"
 
     if class_set & VERY_LIGHT_PHOTO_CLASSES:
         profile = "very_light"
@@ -383,14 +391,18 @@ def decide_frame_augmentation(
         profile = "medium"
 
     return FrameDecision(
-        augment_times=augment_times,
         trigger=trigger,
         profile=profile,
         canonical_classes=tuple(canonical_classes),
         class_counts=dict(sorted(class_counts.items())),
+        has_target_tail=has_target_tail,
+        has_long_tail=has_long_tail,
         target_tail_count=target_tail_count,
-        car_count=car_count,
-        sampling_score=round(float(sampling_score), 3),
+        long_tail_count=long_tail_count,
+        base_color_only_count=compute_base_color_only_count(has_target_tail, has_long_tail),
+        color_priority=round(
+            compute_color_priority(class_counts, target_tail_count, long_tail_count), 3
+        ),
     )
 
 
@@ -472,50 +484,107 @@ def augment_position_json(position_data: Mapping[str, Any], new_frame_id: str) -
     return augmented
 
 
-def sample_photometric_plan(rng: np.random.Generator, profile_name: str) -> Dict[str, Any]:
+def make_identity_photometric_plan(profile_name: str) -> Dict[str, Any]:
+    return {
+        "profile": profile_name,
+        "intensity": "identity",
+        "brightness_shift": 0.0,
+        "contrast_scale": 1.0,
+        "gamma": None,
+        "wb_gains_bgr": None,
+        "saturation_scale": None,
+        "shadow_strength": None,
+        "fog_strength": None,
+        "blur_kernel": 0,
+        "noise_sigma": 0.0,
+        "jpeg_quality": 100,
+    }
+
+
+def scale_probability(probability: float, scale: float) -> float:
+    return min(max(probability * scale, 0.0), 1.0)
+
+
+def scale_range_from_neutral(
+    values: Sequence[float], neutral: float, scale: float
+) -> Tuple[float, float]:
+    scaled_values = [neutral + (float(value) - neutral) * scale for value in values]
+    low, high = sorted(scaled_values)
+    return low, high
+
+
+def sample_photometric_plan(
+    rng: np.random.Generator, profile_name: str, intensity_name: str
+) -> Dict[str, Any]:
+    if intensity_name == "identity":
+        return make_identity_photometric_plan(profile_name)
+
     cfg = PHOTO_PROFILES[profile_name]
-    brightness_shift = float(rng.uniform(-cfg["brightness_px"], cfg["brightness_px"]))
-    contrast_scale = float(rng.uniform(1.0 - cfg["contrast_delta"], 1.0 + cfg["contrast_delta"]))
+    intensity_cfg = PHOTO_INTENSITY_SCALES[intensity_name]
+    magnitude_scale = float(intensity_cfg["magnitude_scale"])
+    probability_scale = float(intensity_cfg["probability_scale"])
+
+    brightness_shift = float(
+        rng.uniform(
+            -cfg["brightness_px"] * magnitude_scale,
+            cfg["brightness_px"] * magnitude_scale,
+        )
+    )
+    contrast_delta = float(cfg["contrast_delta"]) * magnitude_scale
+    contrast_scale = float(rng.uniform(1.0 - contrast_delta, 1.0 + contrast_delta))
 
     gamma_value: Optional[float] = None
-    if rng.random() < cfg["gamma_prob"]:
-        gamma_value = float(rng.uniform(1.0 - cfg["gamma_delta"], 1.0 + cfg["gamma_delta"]))
+    gamma_delta = float(cfg["gamma_delta"]) * magnitude_scale
+    if rng.random() < scale_probability(float(cfg["gamma_prob"]), probability_scale):
+        gamma_value = float(rng.uniform(1.0 - gamma_delta, 1.0 + gamma_delta))
 
     wb_gains: Optional[List[float]] = None
-    if rng.random() < cfg["wb_prob"]:
+    wb_delta = float(cfg["wb_delta"]) * magnitude_scale
+    if rng.random() < scale_probability(float(cfg["wb_prob"]), probability_scale):
         wb_gains = [
-            float(rng.uniform(1.0 - cfg["wb_delta"], 1.0 + cfg["wb_delta"]))
+            float(rng.uniform(1.0 - wb_delta, 1.0 + wb_delta))
             for _ in range(3)
         ]
 
     saturation_scale: Optional[float] = None
-    if rng.random() < cfg["saturation_prob"]:
+    saturation_delta = float(cfg["saturation_delta"]) * magnitude_scale
+    if rng.random() < scale_probability(float(cfg["saturation_prob"]), probability_scale):
         saturation_scale = float(
-            rng.uniform(1.0 - cfg["saturation_delta"], 1.0 + cfg["saturation_delta"])
+            rng.uniform(1.0 - saturation_delta, 1.0 + saturation_delta)
         )
 
     shadow_strength: Optional[float] = None
-    if rng.random() < cfg["shadow_prob"]:
-        shadow_strength = float(rng.uniform(*cfg["shadow_strength"]))
+    if rng.random() < scale_probability(float(cfg["shadow_prob"]), probability_scale):
+        shadow_range = scale_range_from_neutral(cfg["shadow_strength"], neutral=1.0, scale=magnitude_scale)
+        shadow_strength = float(rng.uniform(*shadow_range))
 
     fog_strength: Optional[float] = None
-    if rng.random() < cfg["fog_prob"]:
-        fog_strength = float(rng.uniform(*cfg["fog_strength"]))
+    if rng.random() < scale_probability(float(cfg["fog_prob"]), probability_scale):
+        fog_low, fog_high = [float(value) * magnitude_scale for value in cfg["fog_strength"]]
+        fog_strength = float(rng.uniform(fog_low, fog_high))
 
     blur_kernel = 0
-    if rng.random() < cfg["blur_prob"]:
-        blur_kernel = int(rng.choice(cfg["blur_kernels"]))
+    if rng.random() < scale_probability(float(cfg["blur_prob"]), probability_scale):
+        blur_kernels = sorted({int(value) for value in cfg["blur_kernels"]})
+        if magnitude_scale >= 1.35:
+            blur_kernels.append(5)
+        if magnitude_scale >= 1.60:
+            blur_kernels.append(7)
+        blur_kernel = int(rng.choice(sorted(set(blur_kernels))))
 
     noise_sigma = 0.0
-    if rng.random() < cfg["noise_prob"]:
-        noise_sigma = float(rng.uniform(*cfg["noise_sigma"]))
+    if rng.random() < scale_probability(float(cfg["noise_prob"]), probability_scale):
+        noise_low, noise_high = [float(value) * magnitude_scale for value in cfg["noise_sigma"]]
+        noise_sigma = float(rng.uniform(noise_low, noise_high))
 
     jpeg_quality = 100
-    if rng.random() < cfg["jpeg_prob"]:
-        jpeg_quality = int(rng.integers(cfg["jpeg_quality"][0], cfg["jpeg_quality"][1] + 1))
+    if rng.random() < scale_probability(float(cfg["jpeg_prob"]), probability_scale):
+        base_quality = int(rng.integers(cfg["jpeg_quality"][0], cfg["jpeg_quality"][1] + 1))
+        jpeg_quality = int(np.clip(round(100.0 - (100.0 - base_quality) * magnitude_scale), 1, 100))
 
     return {
         "profile": profile_name,
+        "intensity": intensity_name,
         "brightness_shift": brightness_shift,
         "contrast_scale": contrast_scale,
         "gamma": gamma_value,
@@ -636,16 +705,13 @@ def apply_photometric_plan(
     return out
 
 
-def augment_images(
-    scene_dir: Path,
-    output_dir: Path,
-    frame_id: str,
-    new_frame_id: str,
-    do_flip: bool,
-    photometric_plan: Mapping[str, Any],
-    seed: int,
-) -> Dict[str, int]:
-    image_widths: Dict[str, int] = {}
+def choose_color_intensity(decision: FrameDecision, color_only_index: int) -> str:
+    cycle = COLOR_INTENSITY_CYCLES[decision.trigger]
+    return cycle[color_only_index % len(cycle)]
+
+
+def load_frame_images(scene_dir: Path, frame_id: str) -> Dict[str, Tuple[np.ndarray, str]]:
+    source_images: Dict[str, Tuple[np.ndarray, str]] = {}
     for image_dir in IMAGE_DIRS:
         src_path = find_single_file(scene_dir / image_dir, frame_id)
         if src_path is None:
@@ -653,34 +719,58 @@ def augment_images(
         image = cv2.imread(str(src_path), cv2.IMREAD_COLOR)
         if image is None:
             raise RuntimeError(f"Failed to read image: {src_path}")
+        source_images[image_dir] = (image, src_path.suffix.lower())
+    return source_images
 
+
+def load_frame_metadata(
+    scene_dir: Path, frame_id: str
+) -> Tuple[Mapping[str, Any], Sequence[Mapping[str, Any]], Mapping[str, Any]]:
+    return (
+        load_json(scene_dir / "result" / f"{frame_id}.json"),
+        load_json(scene_dir / "camera_config" / f"{frame_id}.json"),
+        load_json(scene_dir / "position" / f"{frame_id}.json"),
+    )
+
+
+def save_augmented_images(
+    source_images: Mapping[str, Tuple[np.ndarray, str]],
+    output_dir: Path,
+    new_frame_id: str,
+    do_flip: bool,
+    photometric_plan: Mapping[str, Any],
+    seed: int,
+) -> None:
+    for image_dir, (source_image, suffix) in source_images.items():
+        image = source_image.copy()
         if do_flip:
             image = cv2.flip(image, 1)
 
         image_rng = stable_rng(seed, new_frame_id, image_dir)
         image = apply_photometric_plan(image, photometric_plan, image_rng)
 
-        dst_path = output_dir / image_dir / f"{new_frame_id}{src_path.suffix.lower()}"
+        dst_path = output_dir / image_dir / f"{new_frame_id}{suffix}"
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         if not cv2.imwrite(str(dst_path), image):
             raise RuntimeError(f"Failed to write image: {dst_path}")
-        image_widths[image_dir] = int(image.shape[1])
 
-    return image_widths
+
+def build_image_widths(source_images: Mapping[str, Tuple[np.ndarray, str]]) -> Dict[str, int]:
+    return {
+        image_dir: int(image.shape[1])
+        for image_dir, (image, _) in source_images.items()
+    }
 
 
 def save_augmented_metadata_files(
-    scene_dir: Path,
     output_dir: Path,
-    frame_id: str,
     new_frame_id: str,
+    label_data: Mapping[str, Any],
+    camera_config: Sequence[Mapping[str, Any]],
+    position_data: Mapping[str, Any],
     do_flip: bool,
     image_widths: Mapping[str, int],
 ) -> None:
-    label_data = load_json(scene_dir / "result" / f"{frame_id}.json")
-    camera_config = load_json(scene_dir / "camera_config" / f"{frame_id}.json")
-    position_data = load_json(scene_dir / "position" / f"{frame_id}.json")
-
     save_json(
         augment_label_json(label_data, image_widths=image_widths, do_flip=do_flip),
         output_dir / "result" / f"{new_frame_id}.json",
@@ -745,6 +835,87 @@ def maybe_limit_frame_ids(frame_ids: List[str], max_frames: Optional[int]) -> Li
     return frame_ids[: max(0, max_frames)]
 
 
+def collect_scene_frame_decisions(
+    scene_dir: Path, max_frames: Optional[int]
+) -> Tuple[List[str], Dict[str, FrameDecision]]:
+    frame_ids = maybe_limit_frame_ids(collect_frame_ids(scene_dir), max_frames=max_frames)
+    frame_decisions: Dict[str, FrameDecision] = {}
+    for frame_id in frame_ids:
+        label_data = load_json(scene_dir / "result" / f"{frame_id}.json")
+        decision = decide_frame_augmentation(label_data)
+        if decision is not None:
+            frame_decisions[frame_id] = decision
+    return frame_ids, frame_decisions
+
+
+def proportional_allocation(weights: Sequence[float], total_count: int) -> List[int]:
+    if not weights:
+        return []
+    if total_count <= 0:
+        return [0 for _ in weights]
+
+    safe_weights = [max(float(weight), 0.0) for weight in weights]
+    weight_sum = sum(safe_weights)
+    if weight_sum <= 0.0:
+        base = total_count // len(safe_weights)
+        counts = [base for _ in safe_weights]
+        for index in range(total_count - base * len(safe_weights)):
+            counts[index] += 1
+        return counts
+
+    raw_counts = [total_count * weight / weight_sum for weight in safe_weights]
+    counts = [int(math.floor(value)) for value in raw_counts]
+    remaining = total_count - sum(counts)
+    if remaining <= 0:
+        return counts
+
+    order = sorted(
+        range(len(raw_counts)),
+        key=lambda index: (-(raw_counts[index] - counts[index]), -safe_weights[index], index),
+    )
+    for index in order[:remaining]:
+        counts[index] += 1
+    return counts
+
+
+def plan_scene_color_only_counts(
+    scene_decisions: Mapping[str, Dict[str, FrameDecision]],
+    target_color_only_frames: int,
+) -> Dict[str, Dict[str, int]]:
+    frame_keys: List[Tuple[str, str]] = []
+    decisions: List[FrameDecision] = []
+    for scene_name in sorted(scene_decisions):
+        for frame_id in sorted(scene_decisions[scene_name]):
+            frame_keys.append((scene_name, frame_id))
+            decisions.append(scene_decisions[scene_name][frame_id])
+
+    if not frame_keys:
+        return {}
+
+    required_color_only_frames = max(0, int(target_color_only_frames))
+    base_color_only_counts = [decision.base_color_only_count for decision in decisions]
+
+    if required_color_only_frames >= sum(base_color_only_counts):
+        color_only_counts = list(base_color_only_counts)
+        remaining_color_only_frames = required_color_only_frames - sum(color_only_counts)
+        extra_color_only_counts = proportional_allocation(
+            [decision.color_priority for decision in decisions], remaining_color_only_frames
+        )
+        color_only_counts = [
+            base_count + extra_count
+            for base_count, extra_count in zip(color_only_counts, extra_color_only_counts)
+        ]
+    else:
+        color_only_counts = proportional_allocation(
+            base_color_only_counts, required_color_only_frames
+        )
+
+    scene_color_only_counts: Dict[str, Dict[str, int]] = {}
+    for (scene_name, frame_id), color_only_count in zip(frame_keys, color_only_counts):
+        scene_color_only_counts.setdefault(scene_name, {})[frame_id] = color_only_count
+    return scene_color_only_counts
+
+
 def is_scene_dir(path: Path) -> bool:
     required_dirs = (*METADATA_DIRS, *IMAGE_DIRS)
     return path.is_dir() and all((path / folder).is_dir() for folder in required_dirs)
@@ -766,6 +937,7 @@ def run_single_scene(
     copy_originals: bool,
     max_frames: Optional[int],
     overwrite_output: bool,
+    color_only_counts: Mapping[str, int],
 ) -> Dict[str, Any]:
     build_output_dir(
         scene_dir=scene_dir,
@@ -774,67 +946,125 @@ def run_single_scene(
         overwrite_output=overwrite_output,
     )
 
-    frame_ids = maybe_limit_frame_ids(collect_frame_ids(scene_dir), max_frames=max_frames)
+    frame_ids, frame_decisions = collect_scene_frame_decisions(scene_dir, max_frames=max_frames)
     used_numeric_ids = {int(frame_id) for frame_id in frame_ids if frame_id.isdigit()}
     manifest: List[Dict[str, Any]] = []
     generated = 0
+    flip_generated = 0
+    color_only_generated = 0
     skipped = 0
 
     for frame_id in frame_ids:
-        label_data = load_json(scene_dir / "result" / f"{frame_id}.json")
-        decision = decide_frame_augmentation(label_data, seed=seed, frame_id=frame_id)
-        if decision is None:
-            skipped += 1
-            continue
-
+        decision = frame_decisions.get(frame_id)
+        color_only_count = int(color_only_counts.get(frame_id, 0)) if decision is not None else 0
         new_frame_ids = allocate_numeric_augmented_ids(
             frame_id=frame_id,
-            count=decision.augment_times,
+            count=1 + color_only_count,
             used_ids=used_numeric_ids,
         )
 
-        for aug_idx, new_frame_id in enumerate(new_frame_ids):
-            aug_rng = stable_rng(seed, frame_id, str(aug_idx))
-            # Frames selected for augmentation already contain rare/tail classes,
-            # so always apply the LiDAR-consistent horizontal flip.
-            do_flip = True
-            photometric_plan = sample_photometric_plan(aug_rng, decision.profile)
+        source_images = load_frame_images(scene_dir, frame_id)
+        image_widths = build_image_widths(source_images)
+        label_data, camera_config, position_data = load_frame_metadata(scene_dir, frame_id)
+        frame_class_counts = dict(sorted(collect_object_counts(label_data).items()))
 
-            image_widths = augment_images(
-                scene_dir=scene_dir,
+        if decision is None:
+            skipped += 1
+            flip_trigger = "all_frame_flip"
+            flip_profile_name = "identity"
+            flip_canonical_classes = list(sorted(frame_class_counts))
+            flip_class_counts = frame_class_counts
+            flip_target_tail_count = 0
+            flip_long_tail_count = 0
+        else:
+            flip_trigger = decision.trigger
+            flip_profile_name = decision.profile
+            flip_canonical_classes = list(decision.canonical_classes)
+            flip_class_counts = decision.class_counts
+            flip_target_tail_count = decision.target_tail_count
+            flip_long_tail_count = decision.long_tail_count
+
+        flip_frame_id = new_frame_ids[0]
+        flip_plan = make_identity_photometric_plan(flip_profile_name)
+        save_augmented_images(
+            source_images=source_images,
+            output_dir=output_dir,
+            new_frame_id=flip_frame_id,
+            do_flip=True,
+            photometric_plan=flip_plan,
+            seed=seed,
+        )
+        save_augmented_metadata_files(
+            output_dir=output_dir,
+            new_frame_id=flip_frame_id,
+            label_data=label_data,
+            camera_config=camera_config,
+            position_data=position_data,
+            do_flip=True,
+            image_widths=image_widths,
+        )
+        manifest.append(
+            {
+                "new_frame_id": flip_frame_id,
+                "source_frame_id": frame_id,
+                "augment_index": 0,
+                "augmentation_type": "flip",
+                "trigger": flip_trigger,
+                "profile": flip_profile_name,
+                "canonical_classes": flip_canonical_classes,
+                "class_counts": flip_class_counts,
+                "target_tail_count": flip_target_tail_count,
+                "long_tail_count": flip_long_tail_count,
+                "flip_horizontal": True,
+                "photometric_plan": flip_plan,
+            }
+        )
+        generated += 1
+        flip_generated += 1
+
+        for color_idx in range(color_only_count):
+            new_frame_id = new_frame_ids[color_idx + 1]
+            aug_rng = stable_rng(seed, frame_id, "color_only", str(color_idx))
+            intensity_name = choose_color_intensity(decision, color_idx)
+            photometric_plan = sample_photometric_plan(
+                aug_rng, decision.profile, intensity_name
+            )
+
+            save_augmented_images(
+                source_images=source_images,
                 output_dir=output_dir,
-                frame_id=frame_id,
                 new_frame_id=new_frame_id,
-                do_flip=do_flip,
+                do_flip=False,
                 photometric_plan=photometric_plan,
                 seed=seed,
             )
             save_augmented_metadata_files(
-                scene_dir=scene_dir,
                 output_dir=output_dir,
-                frame_id=frame_id,
                 new_frame_id=new_frame_id,
-                do_flip=do_flip,
+                label_data=label_data,
+                camera_config=camera_config,
+                position_data=position_data,
+                do_flip=False,
                 image_widths=image_widths,
             )
-
             manifest.append(
                 {
                     "new_frame_id": new_frame_id,
                     "source_frame_id": frame_id,
-                    "augment_index": aug_idx,
+                    "augment_index": color_idx + 1,
+                    "augmentation_type": "color_only",
                     "trigger": decision.trigger,
                     "profile": decision.profile,
                     "canonical_classes": list(decision.canonical_classes),
                     "class_counts": decision.class_counts,
                     "target_tail_count": decision.target_tail_count,
-                    "car_count": decision.car_count,
-                    "sampling_score": decision.sampling_score,
-                    "flip_horizontal": do_flip,
+                    "long_tail_count": decision.long_tail_count,
+                    "flip_horizontal": False,
                     "photometric_plan": photometric_plan,
                 }
             )
             generated += 1
+            color_only_generated += 1
 
     save_json(
         {
@@ -843,12 +1073,18 @@ def run_single_scene(
             "seed": seed,
             "copy_originals": copy_originals,
             "input_frame_count": len(frame_ids),
+            "eligible_frame_count": len(frame_decisions),
             "generated_augmented_frames": generated,
+            "generated_flip_frames": flip_generated,
+            "generated_color_only_frames": color_only_generated,
             "skipped_frames": skipped,
             "point_cloud_included": False,
             "manifest": manifest,
             "notes": [
                 "This camera-only export does not copy or generate point_cloud files.",
+                "Every input frame always gets exactly one horizontal flip sample.",
+                "Only frames containing pedestrian/bicycle/motor or long-tail classes receive extra color-only samples.",
+                "Color-only samples only modify image appearance and keep label/calibration geometry unchanged.",
                 "position JSON is copied with only the top-level name updated.",
                 "camera_config is mirrored only when horizontal flip is applied.",
                 "2D_bbox is mirrored within the same image, without swapping camera folders.",
@@ -859,7 +1095,10 @@ def run_single_scene(
     )
 
     print(f"Input frames considered: {len(frame_ids)}")
-    print(f"Frames skipped (no rare/tail class): {skipped}")
+    print(f"Eligible frames (target/long-tail): {len(frame_decisions)}")
+    print(f"Frames without target/long-tail class (flip-only): {skipped}")
+    print(f"Augmented flip frames generated: {flip_generated}")
+    print(f"Augmented color-only frames generated: {color_only_generated}")
     print(f"Augmented frames generated: {generated}")
     print("Point clouds copied/generated: 0")
     print(f"Saved to: {output_dir}")
@@ -869,7 +1108,10 @@ def run_single_scene(
         "scene_dir": str(scene_dir),
         "output_dir": str(output_dir),
         "input_frame_count": len(frame_ids),
+        "eligible_frame_count": len(frame_decisions),
         "generated_augmented_frames": generated,
+        "generated_flip_frames": flip_generated,
+        "generated_color_only_frames": color_only_generated,
         "skipped_frames": skipped,
     }
 
@@ -881,6 +1123,7 @@ def run(
     copy_originals: bool,
     max_frames: Optional[int],
     overwrite_output: bool,
+    target_total_frames: int,
 ) -> None:
     scene_dirs = collect_scene_dirs(scene_root)
     if not scene_dirs:
@@ -892,21 +1135,51 @@ def run(
     summary: List[Dict[str, Any]] = []
     total_input_frames = 0
     total_generated_frames = 0
+    total_flip_frames = 0
+    total_color_only_frames = 0
+    scene_frame_decisions: Dict[str, Dict[str, FrameDecision]] = {}
+    total_eligible_frames = 0
 
-    for index, scene_dir in enumerate(scene_dirs, start=1):
-        scene_output_dir = output_root / scene_dir.name
-        print(f"[{index}/{len(scene_dirs)}] Processing scene: {scene_dir.name}")
-        scene_summary = run_single_scene(
-            scene_dir=scene_dir,
-            output_dir=scene_output_dir,
-            seed=seed,
-            copy_originals=copy_originals,
-            max_frames=max_frames,
-            overwrite_output=overwrite_output,
+    scene_scan_tasks = [(scene_dir, max_frames) for scene_dir in scene_dirs]
+
+    with ProcessPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+        for scene_dir, frame_ids, frame_decisions in executor.map(
+            _collect_scene_frame_decisions_worker, scene_scan_tasks
+        ):
+            total_input_frames += len(frame_ids)
+            total_eligible_frames += len(frame_decisions)
+            scene_frame_decisions[scene_dir.name] = frame_decisions
+
+        target_generated_frames = max(
+            0,
+            int(target_total_frames) - (total_input_frames if copy_originals else 0),
         )
-        summary.append(scene_summary)
-        total_input_frames += int(scene_summary["input_frame_count"])
-        total_generated_frames += int(scene_summary["generated_augmented_frames"])
+        target_color_only_frames = max(0, target_generated_frames - total_input_frames)
+        scene_color_only_counts = plan_scene_color_only_counts(
+            scene_frame_decisions, target_color_only_frames=target_color_only_frames
+        )
+
+        scene_tasks = []
+        for index, scene_dir in enumerate(scene_dirs, start=1):
+            scene_output_dir = output_root / scene_dir.name
+            print(f"[{index}/{len(scene_dirs)}] Processing scene: {scene_dir.name}")
+            scene_tasks.append(
+                (
+                    scene_dir,
+                    scene_output_dir,
+                    seed,
+                    copy_originals,
+                    max_frames,
+                    overwrite_output,
+                    scene_color_only_counts.get(scene_dir.name, {}),
+                )
+            )
+
+        for scene_summary in executor.map(_run_single_scene_worker, scene_tasks):
+            summary.append(scene_summary)
+            total_generated_frames += int(scene_summary["generated_augmented_frames"])
+            total_flip_frames += int(scene_summary["generated_flip_frames"])
+            total_color_only_frames += int(scene_summary["generated_color_only_frames"])
 
     save_json(
         {
@@ -914,7 +1187,13 @@ def run(
             "output_root": str(output_root),
             "scene_count": len(summary),
             "total_input_frames": total_input_frames,
+            "eligible_frame_count": total_eligible_frames,
+            "target_total_frames": int(target_total_frames),
             "total_generated_augmented_frames": total_generated_frames,
+            "total_generated_flip_frames": total_flip_frames,
+            "total_generated_color_only_frames": total_color_only_frames,
+            "target_color_only_frames": target_color_only_frames,
+            "total_output_frames": total_generated_frames + (total_input_frames if copy_originals else 0),
             "point_cloud_included": False,
             "scenes": summary,
         },
@@ -922,7 +1201,16 @@ def run(
     )
     print(f"Processed scenes: {len(summary)}")
     print(f"Total input frames: {total_input_frames}")
+    print(f"Eligible frames: {total_eligible_frames}")
+    print(f"Target total frames: {int(target_total_frames)}")
+    print(f"Target color-only frames: {target_color_only_frames}")
+    print(f"Total generated flip frames: {total_flip_frames}")
+    print(f"Total generated color-only frames: {total_color_only_frames}")
     print(f"Total generated augmented frames: {total_generated_frames}")
+    print(
+        "Total output frames: "
+        f"{total_generated_frames + (total_input_frames if copy_originals else 0)}"
+    )
     print(f"Dataset output root: {output_root}")
 
 
@@ -945,6 +1233,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20260415,
         help="Global random seed used to make augmentation deterministic.",
+    )
+    parser.add_argument(
+        "--target-total-frames",
+        type=int,
+        default=DEFAULT_TARGET_TOTAL_FRAMES,
+        help=(
+            "Target total number of frames after augmentation. "
+            "When originals are copied, this includes original frames."
+        ),
     )
     parser.add_argument(
         "--no-copy-originals",
@@ -974,6 +1271,7 @@ def main() -> None:
         copy_originals=not args.no_copy_originals,
         max_frames=args.max_frames,
         overwrite_output=args.overwrite_output,
+        target_total_frames=args.target_total_frames,
     )
 
 
