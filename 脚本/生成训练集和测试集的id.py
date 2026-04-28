@@ -1,17 +1,18 @@
 import os
 import json
-
+from pathlib import Path
 # =========================
 # 路径配置
 # =========================
-dataset_root = '/data9/xieying/mono3d/dataset_fisheye/fisheye_data_2w_frame'
+dataset_root = Path(os.environ["TARGET_RESULT_DIR"]) / "fisheye_data_aug"
 
-train_val_split_path = "/data9/xieying/mono3d/脚本/train_val_split.json"
+script_root = Path(os.environ["TARGET_RESULT_DIR"]) / "scripts"
+script_root.mkdir(parents=True, exist_ok=True)
 
-all_frame_txt = "/data9/xieying/mono3d/脚本/all_frame_ids.txt"
-
-output_train_txt = "/data9/xieying/mono3d/脚本/train_ids.txt"
-output_val_txt = "/data9/xieying/mono3d/脚本/val_ids.txt"
+train_val_split_path = script_root / "train_val_split.json"
+all_frame_txt = script_root / "all_frame_ids.txt"
+output_train_txt = script_root / "train_ids.txt"
+output_val_txt = script_root / "val_ids.txt"
 
 # =========================
 # 读取有效帧

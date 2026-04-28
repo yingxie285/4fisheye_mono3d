@@ -1,15 +1,20 @@
 ### 一、数据增强
-1、运行offline_fisheye_camera_only_aug.py得到增强后的鱼眼数据。
-2、visualize_fisheye_gt.py可视化出来增强的鱼眼数据，按ctrl c打断，只要看一部分就行。
-
+1、运行unzip.sh得到2万帧鱼眼数据
+2、运行offline_fisheye_camera_only_aug.py得到增强后的鱼眼数据。
+3、运行split_train_test.py划分训练集和验证集
 
 ### 二、训练前的数据预处理
 1、将百度数据集转成kitti形式的相机系的真值
-运行脚本\柱面相关的\40CPU_gt_4fisheye_camera_cord.py
+运行40CPU_gt_4fisheye_camera_cord.py
 2、将kitti形式的相机系的真值转成柱面形式的真值
-运行脚本/柱面相关的/40CPU_fisheye2cyl.py
+运行40CPU_fisheye2cyl.py
 3、将柱面形式的真值转成模型需要的ann形式
-运行脚本/柱面相关的/40CPU_cyl_kitti2ann.py
+运行40CPU_cyl_kitti2ann.py
+
+
+运行fisheye2ann.py，输入是5个场景的数据，输出是模型需要的真值ann，1个脚本搞定数据预处理。
+
+
 
 ### 三、训练命令
 在tmux.txt

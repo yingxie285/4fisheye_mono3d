@@ -1,9 +1,10 @@
 import os
 import random
 import json
+from pathlib import Path
 
 # 根目录（修改这里）
-root = r"/data9/xieying/mono3d/dataset_fisheye/fisheye_data_2w_frame"
+root = Path(os.environ["SOURCE_DATASET_FILE_DIR"]) / "fisheye_data_aug"
 
 # 获取所有子文件夹名
 all_folders = [
@@ -27,8 +28,11 @@ data = {
     "val": val_list
 }
 
+script_root = Path(os.environ["TARGET_RESULT_DIR"]) / "scripts"
+script_root.mkdir(parents=True, exist_ok=True)
+train_val_split_path = script_root / "train_val_split.json"
 # 保存 json
-with open("/data9/xieying/mono3d/脚本/train_val_split.json", "w", encoding="utf-8") as f:
+with open(train_val_split_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=4, ensure_ascii=False)
 
 print("总数:", n_total)

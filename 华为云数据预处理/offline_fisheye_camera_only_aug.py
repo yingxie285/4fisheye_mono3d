@@ -14,7 +14,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
-
+import os
 import cv2
 import numpy as np
 
@@ -29,9 +29,9 @@ TARGET_TAIL_CLASSES = frozenset({"pedestrian", "bicycle", "motor","stopper"})
 RARE_CLASSES = frozenset({"animal", "bus", "construction_vehicle", "traffic_cone"})
 TAIL_CLASSES = frozenset({"truck", "trash_bin", "sign", "barrier"})
 LONG_TAIL_CLASSES = RARE_CLASSES | TAIL_CLASSES
-PARALLEL_WORKERS = 40
+PARALLEL_WORKERS = 10
 
-DEFAULT_TARGET_TOTAL_FRAMES = 150000
+DEFAULT_TARGET_TOTAL_FRAMES = 500 #150000
 BASE_TARGET_COLOR_ONLY_COPIES = 4
 BASE_LONG_TAIL_COLOR_ONLY_COPIES = 6
 BASE_TARGET_AND_LONG_TAIL_COLOR_ONLY_COPIES = 8
@@ -1264,9 +1264,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    #从 Octopus 环境变量读取路径
+    scene_root = Path(os.environ["SOURCE_DATASET_FILE_DIR"]) / "fisheye_2wdata"
+    # scene_root = Path(os.environ["TARGET_RESULT_DIR"]) / "fisheye_2wdata"
+    output_root = Path(os.environ["TARGET_RESULT_DIR"]) / "fisheye_data_aug"
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    print("使用输入路径:", scene_root)
+    print("使用输出路径:", output_root)
     run(
-        scene_root=args.scene_dir,
-        output_root=args.output_dir,
+        scene_root=scene_root,
+        output_root=output_root,
+        # scene_root=args.scene_dir,
+        # output_root=args.output_dir,
         seed=args.seed,
         copy_originals=not args.no_copy_originals,
         max_frames=args.max_frames,

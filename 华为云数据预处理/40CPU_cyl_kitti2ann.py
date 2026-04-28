@@ -12,12 +12,14 @@ import numpy as np
 import tqdm
 from pathlib import Path
 
-script_root = Path(os.environ["TARGET_RESULT_DIR"]) / "scripts"
+script_root = Path(os.environ["SOURCE_DATASET_FILE_DIR"]) / "scripts"
 train_val_split_path = script_root / "train_val_split.json"
 
-dataset_dir = Path(os.environ["TARGET_RESULT_DIR"])
+dataset_dir = Path(os.environ["SOURCE_DATASET_FILE_DIR"])
 DEFAULT_INPUT_ROOT = dataset_dir / "data_camera_cyl" / "demo_data" / "trainval_gt_vis"
-DEFAULT_OUTPUT_ROOT = dataset_dir / "data_camera_cyl" / "demo_data" / "trainval"
+
+out_dataset_dir = Path(os.environ["TARGET_RESULT_DIR"])
+DEFAULT_OUTPUT_ROOT = out_dataset_dir / "data_camera_cyl" / "demo_data" / "trainval"
 
 DEFAULT_SCENE_SPLIT_PATH = os.path.join(train_val_split_path)
 CAMERA_NAMES = ("front", "right", "left", "back")
@@ -437,7 +439,7 @@ def parse_args():
     parser.add_argument("--input_root", default=DEFAULT_INPUT_ROOT, help="Input root like data_camera_cyl/demo_data/trainval_gt_vis")
     parser.add_argument("--output_root", default=DEFAULT_OUTPUT_ROOT, help="Output root like data_camera_cyl/demo_data/trainval")
     parser.add_argument("--scene_split", default=DEFAULT_SCENE_SPLIT_PATH, help="Scene-level train/val split json")
-    parser.add_argument("--workers", type=int, default=40, help="Number of worker processes")
+    parser.add_argument("--workers", type=int, default=10, help="Number of worker processes")
     parser.add_argument("--val_ratio", type=float, default=0.2, help="Fallback val ratio when scene split is unavailable or empty")
     parser.add_argument("--no_vis", action="store_true", help="Disable vis_3d_2d output")
     parser.add_argument("--no_hardlink", action="store_true", help="Copy files instead of trying hard links first")

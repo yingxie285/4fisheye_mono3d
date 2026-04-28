@@ -195,11 +195,27 @@ def normalize_angle(angle):
 
 
 def get_camera_3d_8points(obj_size, yaw_lidar, center_lidar, center_in_cam, r_velo2cam, t_velo2cam):
-    liadr_r = np.matrix([[math.cos(yaw_lidar), -math.sin(yaw_lidar), 0], [math.sin(yaw_lidar), math.cos(yaw_lidar), 0], [0, 0, 1]])
+    liadr_r = np.array(
+        [
+            [math.cos(yaw_lidar), -math.sin(yaw_lidar), 0],
+            [math.sin(yaw_lidar), math.cos(yaw_lidar), 0],
+            [0, 0, 1],
+        ],
+        dtype=np.float64,
+    )
     l, w, h = obj_size
-    corners_3d_lidar = np.matrix([[l / 2, l / 2, -l / 2, -l / 2, l / 2, l / 2, -l / 2, -l / 2], [w / 2, -w / 2, -w / 2, w / 2, w / 2, -w / 2, -w / 2, w / 2], [0, 0, 0, 0, h, h, h, h]])
-    corners_3d_lidar = liadr_r * corners_3d_lidar + np.matrix(center_lidar).T
-    corners_3d_cam = r_velo2cam * corners_3d_lidar + t_velo2cam
+    corners_3d_lidar = np.array(
+        [
+            [l / 2, l / 2, -l / 2, -l / 2, l / 2, l / 2, -l / 2, -l / 2],
+            [w / 2, -w / 2, -w / 2, w / 2, w / 2, -w / 2, -w / 2, w / 2],
+            [0, 0, 0, 0, h, h, h, h],
+        ],
+        dtype=np.float64,
+    )
+    center_lidar = np.asarray(center_lidar, dtype=np.float64).reshape(3, 1)
+    center_in_cam = np.asarray(center_in_cam, dtype=np.float64).reshape(-1)
+    corners_3d_lidar = liadr_r @ corners_3d_lidar + center_lidar
+    corners_3d_cam = r_velo2cam @ corners_3d_lidar + t_velo2cam
     x0, z0 = corners_3d_cam[0, 0], corners_3d_cam[2, 0]
     x3, z3 = corners_3d_cam[0, 3], corners_3d_cam[2, 3]
     dx, dz = x0 - x3, z0 - z3
@@ -210,7 +226,7 @@ def get_camera_3d_8points(obj_size, yaw_lidar, center_lidar, center_in_cam, r_ve
     if alpha <= (-1 * math.pi):
         alpha = alpha + 2.0 * math.pi
     rt_matrix1 = np.eye(4)
-    rt_matrix1[:3, 3] = center_lidar
+    rt_matrix1[:3, 3] = center_lidar.reshape(-1)
     rt_matrix1[:3, :3] = liadr_r
     rt_matrix2 = np.eye(4)
     rt_matrix2[:3, 3] = t_velo2cam.flatten()
@@ -342,7 +358,7 @@ def project_all_gt_to_cameras(cam_params, annotations, save_dir):
             h, w, l = hwl
             bottom_center = [x, y, z]
             obj_size = [h, w, l]
-            bottom_center_in_cam = r_velo2cam * np.matrix(bottom_center).T + t_velo2cam
+            bottom_center_in_cam = r_velo2cam @ np.array(bottom_center, dtype=np.float64).reshape(3, 1) + t_velo2cam
             alpha, yaw_cam, pitch_cam, roll_cam, _ = get_camera_3d_8points(obj_size, yaw_lidar, bottom_center, bottom_center_in_cam, r_velo2cam, t_velo2cam)
             cam_x, cam_y, cam_z = convert_point(np.array([x, y, z, 1]).T, Tr_velo_to_cam)
 
@@ -385,7 +401,7 @@ def process_one_frame(cam_cfg_json_path, anno_json_path, image_path, save_dir):
 
 
 if __name__ == "__main__":
-    dataset_dir = Path(os.environ["TARGET_RESULT_DIR"]) / "fisheye_data_aug"
+    dataset_dir = Path(os.environ["SOURCE_DATASET_FILE_DIR"]) / "fisheye_data_aug"
     output_root = Path(os.environ["TARGET_RESULT_DIR"])
     print("经过数据增强的路径:", dataset_dir)
     scene_list = natsorted(os.listdir(dataset_dir))
@@ -437,7 +453,7 @@ if __name__ == "__main__":
             args.append((cam_cfg_json_path, anno_json_path, image_path, save_dir))
 
         try:
-            with Pool(40) as p:
+            with Pool(10) as p:
                 p.starmap(process_one_frame, args)
         except (PermissionError, OSError) as exc:
             print(f"Pool failed for scene {scene_index}, fallback to serial: {exc}")

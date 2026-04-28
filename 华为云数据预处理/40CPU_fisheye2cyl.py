@@ -411,16 +411,17 @@ def collect_jobs(input_root, output_root):
 
 # ====================== main ======================
 if __name__ == "__main__":
-    dataset_dir = Path(os.environ["TARGET_RESULT_DIR"])
+    dataset_dir = Path(os.environ["SOURCE_DATASET_FILE_DIR"])
     input_root = dataset_dir / "data_camera" / "demo_data" / "trainval_gt_vis"
-    output_root = dataset_dir / "data_camera_cyl" / "demo_data" / "trainval_gt_vis"
+    out_dir = Path(os.environ["TARGET_RESULT_DIR"])
+    output_root = out_dir / "data_camera_cyl" / "demo_data" / "trainval_gt_vis"
 
     print_camera_view_report(input_root)
     jobs = collect_jobs(input_root, output_root)
     print("total:", len(jobs))
 
     try:
-        with Pool(40) as p:
+        with Pool(10) as p:
             list(tqdm.tqdm(p.imap(convert_one, jobs), total=len(jobs)))
     except (PermissionError, OSError) as exc:
         print("pool failed, fallback to serial:", exc)
