@@ -5,6 +5,8 @@ from __future__ import print_function
 import argparse
 import os
 import sys
+from pathlib import Path
+PIPELINE_TARGET_ROOT = Path(os.environ["TARGET_RESULT_DIR"])
 
 class opts(object):
   def __init__(self):
@@ -290,8 +292,9 @@ class opts(object):
 
     opt.root_dir = os.path.join(os.path.dirname(__file__), '..', '..')
     # opt.data_dir = os.path.join(opt.root_dir, 'data')
-    opt.data_dir = os.path.abspath(
-      r"C:\Users\yingxie\Desktop\mono3d-main\data_camera_cyl")  #0311 数据集真值改为绝对路径
+    # opt.data_dir = os.path.abspath(
+    #   r"C:\Users\yingxie\Desktop\mono3d-main\data_camera_cyl")  #0311 数据集真值改为绝对路径
+    opt.data_dir = str(PIPELINE_TARGET_ROOT / 'data_camera_cyl') #0512 数据集真值改为华为云路径
     opt.exp_dir = os.path.join(opt.root_dir, 'exp', opt.task)
     opt.save_dir = os.path.join(opt.exp_dir, opt.exp_id)
     opt.debug_dir = os.path.join(opt.save_dir, 'debug')

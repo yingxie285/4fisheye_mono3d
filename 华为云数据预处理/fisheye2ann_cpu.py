@@ -5,33 +5,28 @@ import cv2
 import os
 import shutil
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = SCRIPT_DIR
-PIPELINE_SOURCE_ROOT = Path(os.environ.get("PIPELINE_SOURCE_ROOT", PROJECT_ROOT))
-PIPELINE_TARGET_ROOT = Path(
-    os.environ.get("PIPELINE_TARGET_ROOT", os.path.join(PROJECT_ROOT, "linux_4fisheye"))
-)
+PIPELINE_SOURCE_ROOT = Path(os.environ["OCTPS_DATASET_DIR"])
+PIPELINE_TARGET_ROOT = Path(os.environ["TARGET_RESULT_DIR"])
 
 
 def _enter_stage(stage_name: str, stage_filename: str, source_root: Path, target_root: Path):
-    previous_source = os.environ.get("SOURCE_DATASET_FILE_DIR")
+    previous_source = os.environ.get("OCTPS_DATASET_DIR")
     previous_target = os.environ.get("TARGET_RESULT_DIR")
     previous_argv = sys.argv[:]
 
-    os.environ["SOURCE_DATASET_FILE_DIR"] = str(source_root)
+    os.environ["OCTPS_DATASET_DIR"] = str(source_root)
     os.environ["TARGET_RESULT_DIR"] = str(target_root)
     sys.argv = [stage_filename]
 
-    print("=" * 80)
-    print(f"[{stage_name}] start")
-    print(f"[{stage_name}] SOURCE_DATASET_FILE_DIR={source_root}")
-    print(f"[{stage_name}] TARGET_RESULT_DIR={target_root}")
-    print("=" * 80)
+    print("=" * 80, flush=True)
+    print(f"[{stage_name}] start", flush=True)
+    print(f"[{stage_name}] OCTPS_DATASET_DIR={source_root}", flush=True)
+    print(f"[{stage_name}] TARGET_RESULT_DIR={target_root}", flush=True)
+    print("=" * 80, flush=True)
 
     return previous_source, previous_target, previous_argv
 
@@ -39,15 +34,15 @@ def _enter_stage(stage_name: str, stage_filename: str, source_root: Path, target
 def _leave_stage(stage_name: str, previous_source, previous_target, previous_argv):
     sys.argv = previous_argv
     if previous_source is None:
-        os.environ.pop("SOURCE_DATASET_FILE_DIR", None)
+        os.environ.pop("OCTPS_DATASET_DIR", None)
     else:
-        os.environ["SOURCE_DATASET_FILE_DIR"] = previous_source
+        os.environ["OCTPS_DATASET_DIR"] = previous_source
     if previous_target is None:
         os.environ.pop("TARGET_RESULT_DIR", None)
     else:
         os.environ["TARGET_RESULT_DIR"] = previous_target
 
-    print(f"[{stage_name}] done")
+    print(f"[{stage_name}] done", flush=True)
 
 
 FILESYSTEM_RETRY_TIMES = 5
@@ -85,7 +80,8 @@ def _retry_filesystem_call(func, op_name: str, path):
             print(
                 f"[fs_retry] {op_name} failed for {path} "
                 f"(attempt {attempt}/{FILESYSTEM_RETRY_TIMES}): {exc}. "
-                f"Retrying in {delay_seconds:.1f}s"
+                f"Retrying in {delay_seconds:.1f}s",
+                flush=True,
             )
             time.sleep(delay_seconds)
     raise last_exc
@@ -228,94 +224,6 @@ def _install_filesystem_retry_hooks():
 
 _install_filesystem_retry_hooks()
 
-
-def _env_flag_is_enabled(name: str, *, default: bool = False) -> bool:
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return default
-    return raw_value.strip().lower() not in {"", "0", "false", "no", "off"}
-
-
-def _make_local_pipeline_work_root(final_target_root: Path) -> Path:
-    candidate_roots = []
-    for raw_path in (
-        os.environ.get("PIPELINE_LOCAL_WORK_ROOT"),
-        os.environ.get("MODELARTS_CACHE_DIR"),
-        "/cache",
-        tempfile.gettempdir(),
-        "/tmp",
-    ):
-        if not raw_path:
-            continue
-        candidate = Path(raw_path).expanduser()
-        if candidate not in candidate_roots:
-            candidate_roots.append(candidate)
-
-    last_exc = None
-    for candidate_root in candidate_roots:
-        try:
-            candidate_root.mkdir(parents=True, exist_ok=True)
-            local_root = Path(tempfile.mkdtemp(prefix="fisheye2ann_", dir=str(candidate_root)))
-            print(f"[pipeline_local] local work root: {local_root}")
-            print(f"[pipeline_local] final target root: {final_target_root}")
-            return local_root
-        except OSError as exc:
-            last_exc = exc
-            print(f"[pipeline_local] skip local base {candidate_root}: {exc}")
-
-    raise RuntimeError("Failed to create a writable local pipeline work root.") from last_exc
-
-
-def _copy_tree_contents(src_root: Path, dst_root: Path):
-    if not src_root.exists():
-        raise FileNotFoundError(f"Local pipeline work root does not exist: {src_root}")
-
-    dst_root.mkdir(parents=True, exist_ok=True)
-    copied_dirs = 1
-    copied_files = 0
-
-    for current_root, dirnames, filenames in _ORIGINAL_OS_WALK(src_root):
-        current_root_path = Path(current_root)
-        rel_path = current_root_path.relative_to(src_root)
-        current_dst_root = dst_root if rel_path == Path(".") else dst_root / rel_path
-        current_dst_root.mkdir(parents=True, exist_ok=True)
-
-        for dirname in dirnames:
-            (current_dst_root / dirname).mkdir(parents=True, exist_ok=True)
-            copied_dirs += 1
-
-        for filename in filenames:
-            shutil.copy2(current_root_path / filename, current_dst_root / filename)
-            copied_files += 1
-
-    return copied_dirs, copied_files
-
-
-def _resolve_pipeline_source_root(path: Path) -> Path:
-    # Accept either the parent directory that contains fisheye_2wdata
-    # or the fisheye_2wdata directory itself.
-    if (path / "fisheye_2wdata").exists():
-        return path
-    if path.exists() and path.name == "fisheye_2wdata":
-        return path.parent
-    raise FileNotFoundError(
-        "PIPELINE_SOURCE_ROOT must be either the parent directory containing "
-        f"'fisheye_2wdata' or the 'fisheye_2wdata' directory itself: {path}"
-    )
-
-
-def _get_source_dataset_root() -> Path:
-    return Path(
-        os.environ.get(
-            "SOURCE_DATASET_FILE_DIR",
-            str(_resolve_pipeline_source_root(PIPELINE_SOURCE_ROOT)),
-        )
-    )
-
-
-def _get_target_result_root() -> Path:
-    return Path(os.environ.get("TARGET_RESULT_DIR", str(PIPELINE_TARGET_ROOT)))
-
 # Stage: offline_fisheye_camera_only_aug.py
 
 import argparse
@@ -332,7 +240,7 @@ import shutil
 
 from collections import Counter
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
 from dataclasses import dataclass
 
@@ -362,9 +270,9 @@ offaug_TAIL_CLASSES = frozenset({'truck', 'trash_bin', 'sign', 'barrier'})
 
 offaug_LONG_TAIL_CLASSES = offaug_RARE_CLASSES | offaug_TAIL_CLASSES
 
-offaug_PARALLEL_WORKERS = 10
+offaug_PARALLEL_WORKERS = 6   #16改成6
 
-offaug_DEFAULT_TARGET_TOTAL_FRAMES = 500 #用5个场景是500    #目标是150000帧
+offaug_DEFAULT_TARGET_TOTAL_FRAMES = 150000 #用5个场景是500    #目标是150000帧
 
 offaug_BASE_TARGET_COLOR_ONLY_COPIES = 4
 
@@ -973,6 +881,14 @@ def offaug_collect_scene_dirs(scene_root: Path) -> List[Path]:
     scene_dirs = [path for path in scene_root.iterdir() if offaug_is_scene_dir(path)]
     return sorted(scene_dirs, key=lambda path: path.name)
 
+def offaug_count_output_files(output_root: Path) -> int:
+    if not output_root.exists():
+        return 0
+    total_files = 0
+    for _, _, files in os.walk(output_root):
+        total_files += len(files)
+    return total_files
+
 def offaug_run_single_scene(scene_dir: Path, output_dir: Path, seed: int, copy_originals: bool, max_frames: Optional[int], overwrite_output: bool, color_only_counts: Mapping[str, int]) -> Dict[str, Any]:
     offaug_build_output_dir(scene_dir=scene_dir, output_dir=output_dir, copy_originals=copy_originals, overwrite_output=overwrite_output)
     frame_ids, frame_decisions = offaug_collect_scene_frame_decisions(scene_dir, max_frames=max_frames)
@@ -1023,14 +939,14 @@ def offaug_run_single_scene(scene_dir: Path, output_dir: Path, seed: int, copy_o
             generated += 1
             color_only_generated += 1
     offaug_save_json({'scene_dir': str(scene_dir), 'output_dir': str(output_dir), 'seed': seed, 'copy_originals': copy_originals, 'input_frame_count': len(frame_ids), 'eligible_frame_count': len(frame_decisions), 'generated_augmented_frames': generated, 'generated_flip_frames': flip_generated, 'generated_color_only_frames': color_only_generated, 'skipped_frames': skipped, 'point_cloud_included': False, 'manifest': manifest, 'notes': ['This camera-only export does not copy or generate point_cloud files.', 'Every input frame always gets exactly one horizontal flip sample.', 'Only frames containing pedestrian/bicycle/motor or long-tail classes receive extra color-only samples.', 'Color-only samples only modify image appearance and keep label/calibration geometry unchanged.', 'position JSON is copied with only the top-level name updated.', 'camera_config is mirrored only when horizontal flip is applied.', '2D_bbox is mirrored within the same image, without swapping camera folders.', 'Augmented frame ids are new numeric ids allocated after each source frame id.']}, output_dir / 'augmentation_manifest.json')
-    print(f'Input frames considered: {len(frame_ids)}')
-    print(f'Eligible frames (target/long-tail): {len(frame_decisions)}')
-    print(f'Frames without target/long-tail class (flip-only): {skipped}')
-    print(f'Augmented flip frames generated: {flip_generated}')
-    print(f'Augmented color-only frames generated: {color_only_generated}')
-    print(f'Augmented frames generated: {generated}')
-    print('Point clouds copied/generated: 0')
-    print(f'Saved to: {output_dir}')
+    print(f'Input frames considered: {len(frame_ids)}', flush=True)
+    print(f'Eligible frames (target/long-tail): {len(frame_decisions)}', flush=True)
+    print(f'Frames without target/long-tail class (flip-only): {skipped}', flush=True)
+    print(f'Augmented flip frames generated: {flip_generated}', flush=True)
+    print(f'Augmented color-only frames generated: {color_only_generated}', flush=True)
+    print(f'Augmented frames generated: {generated}', flush=True)
+    print('Point clouds copied/generated: 0', flush=True)
+    print(f'Saved to: {output_dir}', flush=True)
     return {'scene_name': scene_dir.name, 'scene_dir': str(scene_dir), 'output_dir': str(output_dir), 'input_frame_count': len(frame_ids), 'eligible_frame_count': len(frame_decisions), 'generated_augmented_frames': generated, 'generated_flip_frames': flip_generated, 'generated_color_only_frames': color_only_generated, 'skipped_frames': skipped}
 
 def offaug_run(scene_root: Path, output_root: Path, seed: int, copy_originals: bool, max_frames: Optional[int], overwrite_output: bool, target_total_frames: int) -> None:
@@ -1057,24 +973,56 @@ def offaug_run(scene_root: Path, output_root: Path, seed: int, copy_originals: b
         scene_tasks = []
         for index, scene_dir in enumerate(scene_dirs, start=1):
             scene_output_dir = output_root / scene_dir.name
-            print(f'[{index}/{len(scene_dirs)}] Processing scene: {scene_dir.name}')
+            print(f'[{index}/{len(scene_dirs)}] Processing scene: {scene_dir.name}', flush=True)
             scene_tasks.append((scene_dir, scene_output_dir, seed, copy_originals, max_frames, overwrite_output, scene_color_only_counts.get(scene_dir.name, {})))
-        for scene_summary in executor.map(offaug__run_single_scene_worker, scene_tasks):
-            summary.append(scene_summary)
-            total_generated_frames += int(scene_summary['generated_augmented_frames'])
-            total_flip_frames += int(scene_summary['generated_flip_frames'])
-            total_color_only_frames += int(scene_summary['generated_color_only_frames'])
+        pending = {
+            executor.submit(offaug__run_single_scene_worker, task): task[0].name
+            for task in scene_tasks
+        }
+        completed_scene_count = 0
+        while pending:
+            done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+            for future in done:
+                scene_name = pending.pop(future)
+                try:
+                    scene_summary = future.result()
+                except Exception as exc:
+                    print(
+                        f"[offline_fisheye_camera_only_aug] scene failed: {scene_name}; "
+                        f"error={exc}",
+                        flush=True,
+                    )
+                    raise
+                summary.append(scene_summary)
+                completed_scene_count += 1
+                total_generated_frames += int(scene_summary['generated_augmented_frames'])
+                total_flip_frames += int(scene_summary['generated_flip_frames'])
+                total_color_only_frames += int(scene_summary['generated_color_only_frames'])
+                if completed_scene_count == len(scene_tasks):
+                    current_file_count = offaug_count_output_files(output_root)
+                    print(
+                        f"[offline_fisheye_camera_only_aug] completed scene "
+                        f"{completed_scene_count}/{len(scene_tasks)}: {scene_name}; "
+                        f"current_output_files={current_file_count}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[offline_fisheye_camera_only_aug] completed scene "
+                        f"{completed_scene_count}/{len(scene_tasks)}: {scene_name}",
+                        flush=True,
+                    )
     offaug_save_json({'scene_root': str(scene_root), 'output_root': str(output_root), 'scene_count': len(summary), 'total_input_frames': total_input_frames, 'eligible_frame_count': total_eligible_frames, 'target_total_frames': int(target_total_frames), 'total_generated_augmented_frames': total_generated_frames, 'total_generated_flip_frames': total_flip_frames, 'total_generated_color_only_frames': total_color_only_frames, 'target_color_only_frames': target_color_only_frames, 'total_output_frames': total_generated_frames + (total_input_frames if copy_originals else 0), 'point_cloud_included': False, 'scenes': summary}, output_root / 'dataset_augmentation_summary.json')
-    print(f'Processed scenes: {len(summary)}')
-    print(f'Total input frames: {total_input_frames}')
-    print(f'Eligible frames: {total_eligible_frames}')
-    print(f'Target total frames: {int(target_total_frames)}')
-    print(f'Target color-only frames: {target_color_only_frames}')
-    print(f'Total generated flip frames: {total_flip_frames}')
-    print(f'Total generated color-only frames: {total_color_only_frames}')
-    print(f'Total generated augmented frames: {total_generated_frames}')
-    print(f'Total output frames: {total_generated_frames + (total_input_frames if copy_originals else 0)}')
-    print(f'Dataset output root: {output_root}')
+    print(f'Processed scenes: {len(summary)}', flush=True)
+    print(f'Total input frames: {total_input_frames}', flush=True)
+    print(f'Eligible frames: {total_eligible_frames}', flush=True)
+    print(f'Target total frames: {int(target_total_frames)}', flush=True)
+    print(f'Target color-only frames: {target_color_only_frames}', flush=True)
+    print(f'Total generated flip frames: {total_flip_frames}', flush=True)
+    print(f'Total generated color-only frames: {total_color_only_frames}', flush=True)
+    print(f'Total generated augmented frames: {total_generated_frames}', flush=True)
+    print(f'Total output frames: {total_generated_frames + (total_input_frames if copy_originals else 0)}', flush=True)
+    print(f'Dataset output root: {output_root}', flush=True)
 
 def offaug_parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1089,8 +1037,8 @@ def offaug_parse_args() -> argparse.Namespace:
 
 def offaug_main() -> None:
     args = offaug_parse_args()
-    scene_root = _get_source_dataset_root() / 'fisheye_2wdata'
-    output_root = _get_target_result_root() / 'fisheye_data_aug'
+    scene_root = Path(os.environ['OCTPS_DATASET_DIR']) / 'fisheye_2wdata'
+    output_root = Path(os.environ['TARGET_RESULT_DIR']) / 'fisheye_data_aug'
     output_root.mkdir(parents=True, exist_ok=True)
     print('使用输入路径:', scene_root)
     print('使用输出路径:', output_root)
@@ -1423,9 +1371,9 @@ def gtcam_process_one_frame(cam_cfg_json_path, anno_json_path, image_path, save_
     gtcam_project_all_gt_to_cameras(cam_params, annotations, save_dir)
 
 def gtcam_stage_entry() -> None:
-    dataset_dir = _get_source_dataset_root() / 'fisheye_data_aug'
+    dataset_dir = Path(os.environ['OCTPS_DATASET_DIR']) / 'fisheye_data_aug'
 
-    output_root = _get_target_result_root()
+    output_root = Path(os.environ['TARGET_RESULT_DIR'])
 
     print('经过数据增强的路径:', dataset_dir)
 
@@ -1448,7 +1396,7 @@ def gtcam_stage_entry() -> None:
         back_ids = gtcam_list_stems(image_dir['back_dir'])
         common_frame_ids = natsorted(list(cam_cfg_ids & anno_ids & front_ids & right_ids & left_ids & back_ids))
         frame_count = len(common_frame_ids)
-        print(f'Scene {scene_index}: found {frame_count} frames')
+        print(f'Scene {scene_index}: found {frame_count} frames', flush=True)
         args = []
         for frame_id in common_frame_ids:
             cam_cfg_json_path = os.path.join(camera_config_dir, f'{frame_id}.json')
@@ -1462,14 +1410,14 @@ def gtcam_stage_entry() -> None:
             image_path = {'front': front_image_path, 'right': right_image_path, 'left': left_image_path, 'back': back_image_path}
             args.append((cam_cfg_json_path, anno_json_path, image_path, save_dir))
         try:
-            with Pool(10) as p:
+            with Pool(6) as p:
                 p.starmap(gtcam_process_one_frame, args)
         except (PermissionError, OSError) as exc:
-            print(f'Pool failed for scene {scene_index}, fallback to serial: {exc}')
+            print(f'Pool failed for scene {scene_index}, fallback to serial: {exc}', flush=True)
             for arg in args:
                 gtcam_process_one_frame(*arg)
 
-    print('All scenes processed.')
+    print('All scenes processed.', flush=True)
 
 
 def run_stage_40cpu_gt_4fisheye_camera_cord(source_root: Path, target_root: Path) -> None:
@@ -1666,7 +1614,7 @@ def cylconv_read_fisheye_calib(calib_txt):
     return (K, D, Tr)
 
 def cylconv_print_camera_view_report(input_root, hfov=cylconv_DEFAULT_HFOV, vfov=cylconv_DEFAULT_VFOV, target_h=cylconv_TARGET_H, target_w=cylconv_TARGET_W):
-    print('[camera_view_report] begin')
+    print('[camera_view_report] begin', flush=True)
     scene_list = natsorted(os.listdir(input_root))
     for scene_name in scene_list:
         scene_dir = os.path.join(input_root, scene_name)
@@ -1692,9 +1640,10 @@ def cylconv_print_camera_view_report(input_root, hfov=cylconv_DEFAULT_HFOV, vfov
                 f"raw_size={view_info['raw_width']}x{view_info['raw_height']} "
                 f"K_cyl_cy={view_info['K_cyl'][1, 2]:.3f} crop_top={view_info['crop_top']} "
                 f"hfov_deg_for_target_w={np.rad2deg(view_info['suggested_hfov']):.3f} "
-                f"vfov_deg_for_target_h={np.rad2deg(view_info['suggested_vfov']):.3f}"
+                f"vfov_deg_for_target_h={np.rad2deg(view_info['suggested_vfov']):.3f}",
+                flush=True,
             )
-    print('[camera_view_report] end')
+    print('[camera_view_report] end', flush=True)
 
 def cylconv_convert_one(job):
     scene_name, camera_name, file_id, img_path, calib_txt, label_path, out_camera_dir = job
@@ -1709,12 +1658,12 @@ def cylconv_convert_one(job):
             os.makedirs(os.path.dirname(path), exist_ok=True)
         K, D, Tr = cylconv_read_fisheye_calib(calib_txt)
         if K is None or D is None or Tr is None:
-            print('skip invalid calib:', scene_name, camera_name, file_id)
+            print('skip invalid calib:', scene_name, camera_name, file_id, flush=True)
             return
         calib = {'intrinsic': {'f': K[0, 0]}, 'extrinsic': {'R': Tr[:3, :3]}}
         img = cv2.imread(img_path)
         if img is None:
-            print('skip invalid image:', scene_name, camera_name, file_id)
+            print('skip invalid image:', scene_name, camera_name, file_id, flush=True)
             return
         cyl, R_final, K_cyl, view_info = cylconv_fisheye_to_cylindrical(K, D, img, calib)
         with open(calib_txt) as f_in, open(save_calib, 'w') as f_out:
@@ -1744,7 +1693,7 @@ def cylconv_convert_one(job):
         cv2.imwrite(save_img, cyl)
         cv2.imwrite(save_vis, vis)
     except Exception as e:
-        print('error:', scene_name, camera_name, file_id, e)
+        print('error:', scene_name, camera_name, file_id, e, flush=True)
 
 def cylconv_collect_jobs(input_root, output_root):
     jobs = []
@@ -1770,11 +1719,11 @@ def cylconv_collect_jobs(input_root, output_root):
     return jobs
 
 def cylconv_stage_entry() -> None:
-    dataset_dir = _get_source_dataset_root()
+    dataset_dir = Path(os.environ['OCTPS_DATASET_DIR'])
 
     input_root = dataset_dir / 'data_camera' / 'demo_data' / 'trainval_gt_vis'
 
-    out_dir = _get_target_result_root()
+    out_dir = Path(os.environ['TARGET_RESULT_DIR'])
 
     output_root = out_dir / 'data_camera_cyl' / 'demo_data' / 'trainval_gt_vis'
 
@@ -1782,17 +1731,17 @@ def cylconv_stage_entry() -> None:
 
     jobs = cylconv_collect_jobs(input_root, output_root)
 
-    print('total:', len(jobs))
+    print('total:', len(jobs), flush=True)
 
     try:
-        with Pool(10) as p:
+        with Pool(6) as p:
             list(tqdm.tqdm(p.imap(cylconv_convert_one, jobs), total=len(jobs)))
     except (PermissionError, OSError) as exc:
-        print('pool failed, fallback to serial:', exc)
+        print('pool failed, fallback to serial:', exc, flush=True)
         for job in tqdm.tqdm(jobs):
             cylconv_convert_one(job)
 
-    print('done')
+    print('done', flush=True)
 
 
 def run_stage_40cpu_fisheye2cyl(source_root: Path, target_root: Path) -> None:
@@ -1828,15 +1777,15 @@ import tqdm
 
 from pathlib import Path
 
-cylann_script_root = _get_source_dataset_root() / 'scripts'
+cylann_script_root = Path(os.environ['OCTPS_DATASET_DIR']) / 'scripts'
 
 cylann_train_val_split_path = cylann_script_root / 'train_val_split.json'
 
-cylann_dataset_dir = _get_source_dataset_root()
+cylann_dataset_dir = Path(os.environ['OCTPS_DATASET_DIR'])
 
 cylann_DEFAULT_INPUT_ROOT = cylann_dataset_dir / 'data_camera_cyl' / 'demo_data' / 'trainval_gt_vis'
 
-cylann_out_dataset_dir = _get_target_result_root()
+cylann_out_dataset_dir = Path(os.environ['TARGET_RESULT_DIR'])
 
 cylann_DEFAULT_OUTPUT_ROOT = cylann_out_dataset_dir / 'data_camera_cyl' / 'demo_data' / 'trainval'
 
@@ -2090,7 +2039,7 @@ def cylann_parse_args():
     parser.add_argument('--input_root', default=cylann_DEFAULT_INPUT_ROOT, help='Input root like data_camera_cyl/demo_data/trainval_gt_vis')
     parser.add_argument('--output_root', default=cylann_DEFAULT_OUTPUT_ROOT, help='Output root like data_camera_cyl/demo_data/trainval')
     parser.add_argument('--scene_split', default=cylann_DEFAULT_SCENE_SPLIT_PATH, help='Scene-level train/val split json')
-    parser.add_argument('--workers', type=int, default=10, help='Number of worker processes')
+    parser.add_argument('--workers', type=int, default=6, help='Number of worker processes')
     parser.add_argument('--val_ratio', type=float, default=0.2, help='Fallback val ratio when scene split is unavailable or empty')
     parser.add_argument('--no_vis', action='store_true', help='Disable vis_3d_2d output')
     parser.add_argument('--no_hardlink', action='store_true', help='Copy files instead of trying hard links first')
@@ -2138,13 +2087,13 @@ def cylann_main():
     cylann_write_annotations_json(os.path.join(output_root, 'annotations', 'ip42_val_all.json'), ordered_val_records)
     cylann_write_id_txt(os.path.join(output_root, 'train.txt'), train_samples)
     cylann_write_id_txt(os.path.join(output_root, 'val.txt'), val_samples)
-    print('Input root:', input_root)
-    print('Output root:', output_root)
-    print('Split mode:', split_mode)
-    print('Total samples:', len(samples))
-    print('Train samples:', len(train_samples))
-    print('Val samples:', len(val_samples))
-    print('Workers:', worker_count)
+    print('Input root:', input_root, flush=True)
+    print('Output root:', output_root, flush=True)
+    print('Split mode:', split_mode, flush=True)
+    print('Total samples:', len(samples), flush=True)
+    print('Train samples:', len(train_samples), flush=True)
+    print('Val samples:', len(val_samples), flush=True)
+    print('Workers:', worker_count, flush=True)
 
 def cylann_stage_entry() -> None:
     global cylann_script_root
@@ -2154,11 +2103,11 @@ def cylann_stage_entry() -> None:
     global cylann_out_dataset_dir
     global cylann_DEFAULT_OUTPUT_ROOT
     global cylann_DEFAULT_SCENE_SPLIT_PATH
-    cylann_script_root = _get_source_dataset_root() / "scripts"
+    cylann_script_root = Path(os.environ["OCTPS_DATASET_DIR"]) / "scripts"
     cylann_train_val_split_path = cylann_script_root / "train_val_split.json"
-    cylann_dataset_dir = _get_source_dataset_root()
+    cylann_dataset_dir = Path(os.environ["OCTPS_DATASET_DIR"])
     cylann_DEFAULT_INPUT_ROOT = cylann_dataset_dir / "data_camera_cyl" / "demo_data" / "trainval_gt_vis"
-    cylann_out_dataset_dir = _get_target_result_root()
+    cylann_out_dataset_dir = Path(os.environ["TARGET_RESULT_DIR"])
     cylann_DEFAULT_OUTPUT_ROOT = cylann_out_dataset_dir / "data_camera_cyl" / "demo_data" / "trainval"
     cylann_DEFAULT_SCENE_SPLIT_PATH = os.path.join(cylann_train_val_split_path)
     cylann_main()
@@ -2184,7 +2133,7 @@ def split_stage_entry() -> None:
     import random
     from pathlib import Path
 
-    root = _get_source_dataset_root() / "fisheye_data_aug"
+    root = Path(os.environ["OCTPS_DATASET_DIR"]) / "fisheye_data_aug"
 
     all_folders = [
         name for name in os.listdir(root)
@@ -2204,16 +2153,16 @@ def split_stage_entry() -> None:
         "val": val_list,
     }
 
-    script_root = _get_target_result_root() / "scripts"
+    script_root = Path(os.environ["TARGET_RESULT_DIR"]) / "scripts"
     script_root.mkdir(parents=True, exist_ok=True)
     train_val_split_path = script_root / "train_val_split.json"
     with open(train_val_split_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
-    print("Total scenes:", n_total)
-    print("Train scenes:", len(train_list))
-    print("Val scenes:", len(val_list))
-    print("Saved train_val_split.json")
+    print("Total scenes:", n_total, flush=True)
+    print("Train scenes:", len(train_list), flush=True)
+    print("Val scenes:", len(val_list), flush=True)
+    print("Saved train_val_split.json", flush=True)
 
 
 def run_stage_split_train_test(source_root: Path, target_root: Path) -> None:
@@ -2231,52 +2180,26 @@ def run_stage_split_train_test(source_root: Path, target_root: Path) -> None:
 
 
 def main() -> None:
-    resolved_source_root = _resolve_pipeline_source_root(PIPELINE_SOURCE_ROOT)
-
-    if not resolved_source_root.exists():
-        raise FileNotFoundError(f"SOURCE_DATASET_FILE_DIR does not exist: {resolved_source_root}")
-    if not (resolved_source_root / "fisheye_2wdata").exists():
+    if not PIPELINE_SOURCE_ROOT.exists():
+        raise FileNotFoundError(f"OCTPS_DATASET_DIR does not exist: {PIPELINE_SOURCE_ROOT}")
+    if not (PIPELINE_SOURCE_ROOT / "fisheye_2wdata").exists():
         raise FileNotFoundError(
-            f"Input fisheye dataset does not exist: {resolved_source_root / 'fisheye_2wdata'}"
+            f"Input fisheye dataset does not exist: {PIPELINE_SOURCE_ROOT / 'fisheye_2wdata'}"
         )
 
     PIPELINE_TARGET_ROOT.mkdir(parents=True, exist_ok=True)
 
-    local_work_root = None
-    sync_succeeded = False
-    keep_local_work_root = _env_flag_is_enabled("PIPELINE_KEEP_LOCAL_WORKDIR", default=False)
+    run_stage_offline_fisheye_camera_only_aug(PIPELINE_SOURCE_ROOT, PIPELINE_TARGET_ROOT)
+    run_stage_split_train_test(PIPELINE_TARGET_ROOT, PIPELINE_TARGET_ROOT)
+    run_stage_40cpu_gt_4fisheye_camera_cord(PIPELINE_TARGET_ROOT, PIPELINE_TARGET_ROOT)
+    run_stage_40cpu_fisheye2cyl(PIPELINE_TARGET_ROOT, PIPELINE_TARGET_ROOT)
+    run_stage_40cpu_cyl_kitti2ann(PIPELINE_TARGET_ROOT, PIPELINE_TARGET_ROOT)
 
-    try:
-        local_work_root = _make_local_pipeline_work_root(PIPELINE_TARGET_ROOT)
-
-        run_stage_offline_fisheye_camera_only_aug(resolved_source_root, local_work_root)
-        run_stage_split_train_test(local_work_root, local_work_root)
-        run_stage_40cpu_gt_4fisheye_camera_cord(local_work_root, local_work_root)
-        run_stage_40cpu_fisheye2cyl(local_work_root, local_work_root)
-        run_stage_40cpu_cyl_kitti2ann(local_work_root, local_work_root)
-
-        print("=" * 80)
-        print(f"[pipeline_local] sync start: {local_work_root} -> {PIPELINE_TARGET_ROOT}")
-        copied_dirs, copied_files = _copy_tree_contents(local_work_root, PIPELINE_TARGET_ROOT)
-        print(f"[pipeline_local] sync done: {copied_files} files, {copied_dirs} directories")
-        print("=" * 80)
-        sync_succeeded = True
-    finally:
-        if local_work_root is not None:
-            if sync_succeeded and not keep_local_work_root:
-                try:
-                    shutil.rmtree(local_work_root)
-                    print(f"[pipeline_local] removed local work root: {local_work_root}")
-                except OSError as exc:
-                    print(f"[pipeline_local] failed to remove local work root {local_work_root}: {exc}")
-            else:
-                print(f"[pipeline_local] kept local work root: {local_work_root}")
-
-    print("=" * 80)
-    print("Pipeline finished.")
-    print(f"Input root: {resolved_source_root / 'fisheye_2wdata'}")
-    print(f"Final output root: {PIPELINE_TARGET_ROOT / 'data_camera_cyl' / 'demo_data' / 'trainval'}")
-    print("=" * 80)
+    print("=" * 80, flush=True)
+    print("Pipeline finished.", flush=True)
+    print(f"Input root: {PIPELINE_SOURCE_ROOT / 'fisheye_2wdata'}", flush=True)
+    print(f"Final output root: {PIPELINE_TARGET_ROOT / 'data_camera_cyl' / 'demo_data' / 'trainval'}", flush=True)
+    print("=" * 80, flush=True)
 
 
 if __name__ == "__main__":

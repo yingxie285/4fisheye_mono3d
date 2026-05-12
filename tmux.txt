@@ -2,7 +2,7 @@ tmux new -s mono3d_train0416
 conda activate pytorch_env
 python C:\Users\yingxie\Desktop\mono3d-main\git-apa-perception-mono3dod-t2\mono3DOD_Parking\mono3DOD_Parking_code\src\main.py \
   ddd \
-  --exp_id kitti_resnet18 \
+  --exp_id kitti_resnet101 \
   --batch_size 4 \
   --lr 1.25e-4 \
   --gpus 0,1 \
@@ -10,7 +10,7 @@ python C:\Users\yingxie\Desktop\mono3d-main\git-apa-perception-mono3dod-t2\mono3
 
 #windows的一行命令
 conda activate pytorch_env
-python C:\Users\yingxie\Desktop\mono3d-main\git-apa-perception-mono3dod-t2\mono3DOD_Parking\mono3DOD_Parking_code\src\main.py ddd --exp_id kitti_resnet18 --batch_size 4 --lr 1.25e-4 --gpus 0 --save_all --num_workers 0
+python C:\Users\yingxie\Desktop\mono3d-main\git-apa-perception-mono3dod-t2\mono3DOD_Parking\mono3DOD_Parking_code\src\main.py ddd --exp_id kitti_resnet18 --batch_size 4 --lr 1.25e-4 --gpus 0 --save_all --num_workers 0 --arch res_18
   
 ### 连接tmux会话
 tmux attach -t mono3d_train0416

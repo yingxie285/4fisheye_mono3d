@@ -8,6 +8,7 @@ fisheye_data_aug/
 fisheye_data_demo/
 fisheye_data_2w_frame/
 dataset_fisheye/
+windows_4fisheye/
 vis/
 vis_pred_3d/
 git-apa-perception-mono3dod-t2/mono3DOD_Parking/mono3DOD_Parking_code/exp/ddd/default/
