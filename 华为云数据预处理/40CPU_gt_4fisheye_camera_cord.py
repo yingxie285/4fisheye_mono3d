@@ -43,6 +43,8 @@ CAMERA_ORDER = {
     "back": {"image_key": "image3", "camera_index": 3},
 }
 
+VIS_SCENE_LIMIT = 2
+
 
 def list_stems(directory, suffix=None):
     stems = set()
@@ -329,7 +331,7 @@ def load_annotation(anno_json_path):
     return anno_data.get('objects', [])
 
 
-def project_all_gt_to_cameras(cam_params, annotations, save_dir):
+def project_all_gt_to_cameras(cam_params, annotations, save_dir, enable_vis=True):
     for camera_name, params in cam_params.items():
         frame_id = params["frame_id"]
         image_key = params["image_key"]
@@ -381,30 +383,32 @@ def project_all_gt_to_cameras(cam_params, annotations, save_dir):
         camera_save_dir = os.path.join(save_dir, camera_name)
         label_path = save_label_file(annotations_one_camera, camera_save_dir, frame_id)
 
-        vis_dir = os.path.join(camera_save_dir, "vis_from_label")
-        os.makedirs(vis_dir, exist_ok=True)
-        vis_path = os.path.join(vis_dir, f"{frame_id}_vis.jpg")
+        if enable_vis:
+            vis_dir = os.path.join(camera_save_dir, "vis_from_label")
+            os.makedirs(vis_dir, exist_ok=True)
+            vis_path = os.path.join(vis_dir, f"{frame_id}_vis.jpg")
 
-        img_vis = vis_from_label(label_path, image_path, K, D, ego2cam)
-        if img_vis is not None:
-            cv2.imwrite(vis_path, img_vis)
-            print(f"Saved (from label): {vis_path}")
+            img_vis = vis_from_label(label_path, image_path, K, D, ego2cam)
+            if img_vis is not None:
+                cv2.imwrite(vis_path, img_vis)
+                print(f"Saved (from label): {vis_path}")
 
         calib_texts(camera_save_dir, frame_id, K, Tr_velo_to_cam, D)
         image_save(image_path, camera_save_dir, frame_id)
 
 
-def process_one_frame(cam_cfg_json_path, anno_json_path, image_path, save_dir):
+def process_one_frame(cam_cfg_json_path, anno_json_path, image_path, save_dir, enable_vis=True):
     cam_params = load_camera_params(cam_cfg_json_path, image_path)
     annotations = load_annotation(anno_json_path)
-    project_all_gt_to_cameras(cam_params, annotations, save_dir)
+    project_all_gt_to_cameras(cam_params, annotations, save_dir, enable_vis=enable_vis)
 
 
 if __name__ == "__main__":
-    dataset_dir = Path(os.environ["SOURCE_DATASET_FILE_DIR"]) / "fisheye_data_aug"
+    dataset_dir = Path(os.environ["OCTPS_DATASET_DIR"]) / "fisheye_data_aug"
     output_root = Path(os.environ["TARGET_RESULT_DIR"])
     print("经过数据增强的路径:", dataset_dir)
     scene_list = natsorted(os.listdir(dataset_dir))
+    vis_scene_count = 0
     for scene_index in scene_list:
         scene_dir = os.path.join(dataset_dir, scene_index)
         save_dir = output_root / "data_camera" / "demo_data" / "trainval_gt_vis" / scene_dir.split(os.sep)[-1]
@@ -452,12 +456,22 @@ if __name__ == "__main__":
             }
             args.append((cam_cfg_json_path, anno_json_path, image_path, save_dir))
 
+        enable_vis = bool(args) and vis_scene_count < VIS_SCENE_LIMIT
+        if enable_vis:
+            vis_scene_count += 1
+
         try:
-            with Pool(10) as p:
-                p.starmap(process_one_frame, args)
+            with Pool(6) as p:
+                p.starmap(
+                    process_one_frame,
+                    [
+                        (cam_cfg_json_path, anno_json_path, image_path, save_dir, enable_vis)
+                        for cam_cfg_json_path, anno_json_path, image_path, save_dir in args
+                    ],
+                )
         except (PermissionError, OSError) as exc:
             print(f"Pool failed for scene {scene_index}, fallback to serial: {exc}")
             for arg in args:
-                process_one_frame(*arg)
+                process_one_frame(*arg, enable_vis=enable_vis)
 
     print("All scenes processed.")

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 # 根目录（修改这里）
-root = Path(os.environ["SOURCE_DATASET_FILE_DIR"]) / "fisheye_data_aug"
+root = Path(os.environ["OCTPS_DATASET_DIR"]) / "fisheye_data_aug"
 
 # 获取所有子文件夹名
 all_folders = [

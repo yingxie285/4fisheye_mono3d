@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 """Standalone offline augmentation for fisheye camera-only 3D detection data."""
 
 from __future__ import annotations
@@ -9,9 +9,8 @@ import hashlib
 import json
 import math
 import shutil
-import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -654,35 +653,6 @@ DEFAULT_TRAIN_VAL_SPLIT = {
         "20240126-135327_20240126-135338"
     ]
 }
-
-
-def format_elapsed(seconds: float) -> str:
-    if seconds < 1.0:
-        return f"{seconds * 1000.0:.0f} ms"
-    if seconds < 60.0:
-        return f"{seconds:.2f} s"
-    minutes, remaining_seconds = divmod(seconds, 60.0)
-    if minutes < 60.0:
-        return f"{int(minutes)} m {remaining_seconds:.2f} s"
-    hours, remaining_minutes = divmod(minutes, 60.0)
-    return f"{int(hours)} h {int(remaining_minutes)} m {remaining_seconds:.2f} s"
-
-
-def log_message(message: str) -> None:
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] pid={os.getpid()} {message}", flush=True)
-
-
-def log_scene_event(
-    event: str,
-    scene_name: str,
-    scene_split: str,
-    details: Optional[str] = None,
-) -> None:
-    message = f"[{event}] {scene_split} scene: {scene_name}"
-    if details:
-        message += f" | {details}"
-    log_message(message)
 
 
 BASE_TARGET_COLOR_ONLY_COPIES = 4
@@ -1578,13 +1548,10 @@ def is_scene_dir(path: Path) -> bool:
 
 
 def collect_scene_dirs(scene_root: Path) -> List[Path]:
+    if is_scene_dir(scene_root):
+        return [scene_root]
     if not scene_root.is_dir():
         raise FileNotFoundError(f"Scene root does not exist: {scene_root}")
-    if is_scene_dir(scene_root):
-        raise ValueError(
-            "scene_root must be the full dataset root containing all split scenes, "
-            f"but received a single scene directory: {scene_root}"
-        )
     scene_dirs = [path for path in scene_root.iterdir() if is_scene_dir(path)]
     return sorted(scene_dirs, key=lambda path: path.name)
 
@@ -1596,6 +1563,8 @@ def partition_scene_dirs_by_split(
 ) -> Dict[str, List[Path]]:
     scene_dir_by_name = {scene_dir.name: scene_dir for scene_dir in scene_dirs}
     all_split_scene_names = set(split_scenes["train"]) | set(split_scenes["val"])
+    single_scene_input = is_scene_dir(scene_root)
+    subset_scene_input = single_scene_input or len(scene_dir_by_name) < len(all_split_scene_names)
 
     missing_scene_names = {
         split_name: [
@@ -1611,10 +1580,16 @@ def partition_scene_dirs_by_split(
             for split_name, scene_names in missing_scene_names.items()
             if scene_names
         )
-        raise FileNotFoundError(
-            "Some scenes declared in DEFAULT_TRAIN_VAL_SPLIT were not found under "
-            f"{scene_root}: {missing_details}"
-        )
+        if subset_scene_input:
+            print(
+                "Info: current scene_root is a subset of DEFAULT_TRAIN_VAL_SPLIT; "
+                f"ignoring scenes not present under {scene_root}: {missing_details}"
+            )
+        else:
+            raise FileNotFoundError(
+                "Some scenes declared in DEFAULT_TRAIN_VAL_SPLIT were not found under "
+                f"{scene_root}: {missing_details}"
+            )
 
     extra_scene_names = sorted(
         scene_name for scene_name in scene_dir_by_name if scene_name not in all_split_scene_names
@@ -1646,53 +1621,19 @@ def run_single_scene(
     augment_enabled: bool,
     scene_split: str,
 ) -> Dict[str, Any]:
-    scene_start_time = time.perf_counter()
-    log_scene_event(
-        "SCENE_START",
-        scene_dir.name,
-        scene_split,
-        details=(
-            f"augment_enabled={augment_enabled}, copy_originals={copy_originals}, "
-            f"output={output_dir}"
-        ),
-    )
-
-    copy_start_time = time.perf_counter()
     build_output_dir(
         scene_dir=scene_dir,
         output_dir=output_dir,
         copy_originals=copy_originals,
         overwrite_output=overwrite_output,
     )
-    copy_elapsed = time.perf_counter() - copy_start_time
-    log_scene_event(
-        "COPY_DONE",
-        scene_dir.name,
-        scene_split,
-        details=(
-            f"elapsed={format_elapsed(copy_elapsed)}, "
-            f"copy_originals={copy_originals}"
-        ),
-    )
 
-    scan_start_time = time.perf_counter()
     frame_ids, frame_decisions = collect_scene_frame_decisions(
         scene_dir,
         max_frames=max_frames,
         augment_enabled=augment_enabled,
     )
-    scan_elapsed = time.perf_counter() - scan_start_time
-    log_scene_event(
-        "SCAN_DONE",
-        scene_dir.name,
-        scene_split,
-        details=(
-            f"elapsed={format_elapsed(scan_elapsed)}, "
-            f"input_frames={len(frame_ids)}, eligible_frames={len(frame_decisions)}"
-        ),
-    )
     if not augment_enabled:
-        total_elapsed = time.perf_counter() - scene_start_time
         save_json(
             {
                 "scene_dir": str(scene_dir),
@@ -1707,10 +1648,6 @@ def run_single_scene(
                 "generated_flip_frames": 0,
                 "generated_color_only_frames": 0,
                 "skipped_frames": len(frame_ids),
-                "copy_elapsed_seconds": copy_elapsed,
-                "scan_elapsed_seconds": scan_elapsed,
-                "augment_elapsed_seconds": 0.0,
-                "total_elapsed_seconds": total_elapsed,
                 "point_cloud_included": False,
                 "manifest": [],
                 "notes": [
@@ -1721,17 +1658,15 @@ def run_single_scene(
             output_dir / "augmentation_manifest.json",
         )
 
-        log_scene_event(
-            "SCENE_DONE",
-            scene_dir.name,
-            scene_split,
-            details=(
-                f"status=ok, elapsed={format_elapsed(total_elapsed)}, "
-                f"copy={format_elapsed(copy_elapsed)}, scan={format_elapsed(scan_elapsed)}, "
-                f"augment={format_elapsed(0.0)}, input_frames={len(frame_ids)}, "
-                f"eligible_frames=0, generated=0, output={output_dir}"
-            ),
-        )
+        print(f"Input frames considered: {len(frame_ids)}")
+        print(f"Scene split: {scene_split} (augmentation disabled)")
+        print("Eligible frames (target/long-tail): 0")
+        print(f"Frames without augmentation: {len(frame_ids)}")
+        print("Augmented flip frames generated: 0")
+        print("Augmented color-only frames generated: 0")
+        print("Augmented frames generated: 0")
+        print("Point clouds copied/generated: 0")
+        print(f"Saved to: {output_dir}")
 
         return {
             "scene_name": scene_dir.name,
@@ -1745,10 +1680,6 @@ def run_single_scene(
             "generated_flip_frames": 0,
             "generated_color_only_frames": 0,
             "skipped_frames": len(frame_ids),
-            "copy_elapsed_seconds": copy_elapsed,
-            "scan_elapsed_seconds": scan_elapsed,
-            "augment_elapsed_seconds": 0.0,
-            "total_elapsed_seconds": total_elapsed,
         }
 
     used_numeric_ids = {int(frame_id) for frame_id in frame_ids if frame_id.isdigit()}
@@ -1758,7 +1689,6 @@ def run_single_scene(
     color_only_generated = 0
     skipped = 0
 
-    augment_start_time = time.perf_counter()
     for frame_id in frame_ids:
         decision = frame_decisions.get(frame_id)
         color_only_count = int(color_only_counts.get(frame_id, 0)) if decision is not None else 0
@@ -1870,8 +1800,6 @@ def run_single_scene(
             )
             generated += 1
             color_only_generated += 1
-    augment_elapsed = time.perf_counter() - augment_start_time
-    total_elapsed = time.perf_counter() - scene_start_time
 
     save_json(
         {
@@ -1887,10 +1815,6 @@ def run_single_scene(
             "generated_flip_frames": flip_generated,
             "generated_color_only_frames": color_only_generated,
             "skipped_frames": skipped,
-            "copy_elapsed_seconds": copy_elapsed,
-            "scan_elapsed_seconds": scan_elapsed,
-            "augment_elapsed_seconds": augment_elapsed,
-            "total_elapsed_seconds": total_elapsed,
             "point_cloud_included": False,
             "manifest": manifest,
             "notes": [
@@ -1907,27 +1831,15 @@ def run_single_scene(
         output_dir / "augmentation_manifest.json",
     )
 
-    log_scene_event(
-        "AUGMENT_DONE",
-        scene_dir.name,
-        scene_split,
-        details=(
-            f"elapsed={format_elapsed(augment_elapsed)}, "
-            f"flip_generated={flip_generated}, color_only_generated={color_only_generated}, "
-            f"generated={generated}"
-        ),
-    )
-    log_scene_event(
-        "SCENE_DONE",
-        scene_dir.name,
-        scene_split,
-        details=(
-            f"status=ok, elapsed={format_elapsed(total_elapsed)}, "
-            f"copy={format_elapsed(copy_elapsed)}, scan={format_elapsed(scan_elapsed)}, "
-            f"augment={format_elapsed(augment_elapsed)}, input_frames={len(frame_ids)}, "
-            f"eligible_frames={len(frame_decisions)}, generated={generated}, output={output_dir}"
-        ),
-    )
+    print(f"Input frames considered: {len(frame_ids)}")
+    print(f"Scene split: {scene_split} (augmentation enabled)")
+    print(f"Eligible frames (target/long-tail): {len(frame_decisions)}")
+    print(f"Frames without target/long-tail class (flip-only): {skipped}")
+    print(f"Augmented flip frames generated: {flip_generated}")
+    print(f"Augmented color-only frames generated: {color_only_generated}")
+    print(f"Augmented frames generated: {generated}")
+    print("Point clouds copied/generated: 0")
+    print(f"Saved to: {output_dir}")
 
     return {
         "scene_name": scene_dir.name,
@@ -1941,10 +1853,6 @@ def run_single_scene(
         "generated_flip_frames": flip_generated,
         "generated_color_only_frames": color_only_generated,
         "skipped_frames": skipped,
-        "copy_elapsed_seconds": copy_elapsed,
-        "scan_elapsed_seconds": scan_elapsed,
-        "augment_elapsed_seconds": augment_elapsed,
-        "total_elapsed_seconds": total_elapsed,
     }
 
 
@@ -1957,7 +1865,6 @@ def run(
     overwrite_output: bool,
     target_total_frames: int,
 ) -> None:
-    run_start_time = time.perf_counter()
     scene_dirs = collect_scene_dirs(scene_root)
     if not scene_dirs:
         raise FileNotFoundError(
@@ -2006,14 +1913,7 @@ def run(
         for scene_dir in ordered_scene_dirs
     ]
 
-    log_message(
-        f"Dataset run start | scene_root={scene_root} | output_root={output_root} | "
-        f"train_scenes={len(train_scene_dirs)} | val_scenes={len(val_scene_dirs)} | "
-        f"workers={PARALLEL_WORKERS}"
-    )
-
     with ProcessPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
-        dataset_scan_start_time = time.perf_counter()
         for scene_dir, frame_ids, frame_decisions in executor.map(
             _collect_scene_frame_decisions_worker, scene_scan_tasks
         ):
@@ -2026,28 +1926,17 @@ def run(
                 scene_frame_decisions[scene_name] = frame_decisions
             else:
                 val_input_frames += len(frame_ids)
-        dataset_scan_elapsed = time.perf_counter() - dataset_scan_start_time
 
-        log_message("Using built-in DEFAULT_TRAIN_VAL_SPLIT")
-        log_message(f"Train scenes found: {len(train_scene_dirs)}")
-        log_message(f"Val scenes found: {len(val_scene_dirs)}")
-        log_message(
-            "Dataset scan done | "
-            f"elapsed={format_elapsed(dataset_scan_elapsed)} | "
-            f"total_input_frames={total_input_frames} | "
-            f"train_input_frames={train_input_frames} | "
-            f"val_input_frames={val_input_frames} | "
-            f"eligible_frames={total_eligible_frames}"
-        )
-        log_message("Val scenes (augmentation disabled):")
+        print("Using built-in DEFAULT_TRAIN_VAL_SPLIT")
+        print(f"Train scenes found: {len(train_scene_dirs)}")
+        print(f"Val scenes found: {len(val_scene_dirs)}")
+        print("Val scenes (augmentation disabled):")
         for scene_dir in val_scene_dirs:
             scene_name = scene_dir.name
-            log_message(
-                f"  {scene_name}: {scene_input_frame_counts.get(scene_name, 0)} frames"
-            )
-        log_message(f"Val source frames traversed (no augmentation): {val_input_frames}")
-        log_message(f"Train source frames traversed: {train_input_frames}")
-        log_message(f"Train source frames that will be augmented: {train_input_frames}")
+            print(f"  {scene_name}: {scene_input_frame_counts.get(scene_name, 0)} frames")
+        print(f"Val source frames traversed (no augmentation): {val_input_frames}")
+        print(f"Train source frames traversed: {train_input_frames}")
+        print(f"Train source frames that will be augmented: {train_input_frames}")
 
         target_generated_frames = max(
             0,
@@ -2063,14 +1952,9 @@ def run(
             scene_name = scene_dir.name
             scene_split = scene_split_by_name[scene_name]
             scene_output_dir = output_root / scene_dir.name
-            log_scene_event(
-                "SCENE_QUEUED",
-                scene_name,
-                scene_split,
-                details=(
-                    f"queue_index={index}/{len(ordered_scene_dirs)}, "
-                    f"planned_color_only_frames={sum(scene_color_only_counts.get(scene_name, {}).values())}"
-                ),
+            print(
+                f"[{index}/{len(ordered_scene_dirs)}] Processing {scene_split} scene: "
+                f"{scene_name}"
             )
             scene_tasks.append(
                 (
@@ -2086,26 +1970,11 @@ def run(
                 )
             )
 
-        futures = {
-            executor.submit(_run_single_scene_worker, task): task[0].name
-            for task in scene_tasks
-        }
-        for completed_index, future in enumerate(as_completed(futures), start=1):
-            scene_name = futures[future]
-            try:
-                scene_summary = future.result()
-            except Exception as exc:
-                log_message(f"[SCENE_FAILED] scene={scene_name} | error={exc!r}")
-                raise
+        for scene_summary in executor.map(_run_single_scene_worker, scene_tasks):
             summary.append(scene_summary)
             total_generated_frames += int(scene_summary["generated_augmented_frames"])
             total_flip_frames += int(scene_summary["generated_flip_frames"])
             total_color_only_frames += int(scene_summary["generated_color_only_frames"])
-            log_message(
-                f"Scene result collected | {completed_index}/{len(scene_tasks)} | "
-                f"{scene_summary['scene_split']} scene: {scene_summary['scene_name']} | "
-                f"elapsed={format_elapsed(float(scene_summary.get('total_elapsed_seconds', 0.0)))}"
-            )
 
     save_json(
         {
@@ -2115,8 +1984,6 @@ def run(
             "scene_count": len(summary),
             "train_scene_count": len(train_scene_dirs),
             "val_scene_count": len(val_scene_dirs),
-            "dataset_scan_elapsed_seconds": dataset_scan_elapsed,
-            "total_elapsed_seconds": time.perf_counter() - run_start_time,
             "total_input_frames": total_input_frames,
             "train_input_frames": train_input_frames,
             "val_input_frames": val_input_frames,
@@ -2132,27 +1999,37 @@ def run(
         },
         output_root / "dataset_augmentation_summary.json",
     )
-    total_elapsed = time.perf_counter() - run_start_time
-    log_message(f"Processed scenes: {len(summary)}")
-    log_message(f"Total input frames: {total_input_frames}")
-    log_message(f"Train input frames: {train_input_frames}")
-    log_message(f"Val input frames: {val_input_frames}")
-    log_message(f"Eligible frames: {total_eligible_frames}")
-    log_message(f"Target total frames: {int(target_total_frames)}")
-    log_message(f"Target color-only frames: {target_color_only_frames}")
-    log_message(f"Total generated flip frames: {total_flip_frames}")
-    log_message(f"Total generated color-only frames: {total_color_only_frames}")
-    log_message(f"Total generated augmented frames: {total_generated_frames}")
-    log_message(
+    print(f"Processed scenes: {len(summary)}")
+    print(f"Total input frames: {total_input_frames}")
+    print(f"Train input frames: {train_input_frames}")
+    print(f"Val input frames: {val_input_frames}")
+    print(f"Eligible frames: {total_eligible_frames}")
+    print(f"Target total frames: {int(target_total_frames)}")
+    print(f"Target color-only frames: {target_color_only_frames}")
+    print(f"Total generated flip frames: {total_flip_frames}")
+    print(f"Total generated color-only frames: {total_color_only_frames}")
+    print(f"Total generated augmented frames: {total_generated_frames}")
+    print(
         "Total output frames: "
         f"{total_generated_frames + (total_input_frames if copy_originals else 0)}"
     )
-    log_message(f"Dataset output root: {output_root}")
-    log_message(f"Dataset run done | elapsed={format_elapsed(total_elapsed)}")
+    print(f"Dataset output root: {output_root}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--scene-dir",
+        type=Path,
+        default=Path("fisheye_2wdata"),
+        help="Input dataset root containing multiple scene directories, or a single scene directory.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("fisheye_data_aug"),
+        help="Output dataset root. Each scene keeps its original scene name under this directory.",
+    )
     parser.add_argument(
         "--seed",
         type=int,
@@ -2182,24 +2059,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite-output",
         action="store_true",
-        help="Delete and recreate the output dataset root if it already exists.",
+        help="Delete and recreate --output-dir if it already exists.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    #从 Octopus 环境变量读取路径
     scene_root = Path(os.environ["OCTPS_DATASET_DIR"]) / "fisheye_2wdata"
+    # scene_root = Path(os.environ["TARGET_RESULT_DIR"]) / "fisheye_2wdata"
     output_root = Path(os.environ["TARGET_RESULT_DIR"]) / "fisheye_data_aug"
     output_root.mkdir(parents=True, exist_ok=True)
-    log_message(f"Using input path: {scene_root}")
-    log_message(f"Using output path: {output_root}")
 
     print("使用输入路径:", scene_root)
     print("使用输出路径:", output_root)
     run(
         scene_root=scene_root,
         output_root=output_root,
+        # scene_root=args.scene_dir,
+        # output_root=args.output_dir,
         seed=args.seed,
         copy_originals=not args.no_copy_originals,
         max_frames=args.max_frames,
@@ -2210,4 +2089,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

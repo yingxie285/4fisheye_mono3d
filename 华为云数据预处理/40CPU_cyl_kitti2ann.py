@@ -12,10 +12,10 @@ import numpy as np
 import tqdm
 from pathlib import Path
 
-script_root = Path(os.environ["SOURCE_DATASET_FILE_DIR"]) / "scripts"
+script_root = Path(os.environ["OCTPS_DATASET_DIR"]) / "scripts"
 train_val_split_path = script_root / "train_val_split.json"
 
-dataset_dir = Path(os.environ["SOURCE_DATASET_FILE_DIR"])
+dataset_dir = Path(os.environ["OCTPS_DATASET_DIR"])
 DEFAULT_INPUT_ROOT = dataset_dir / "data_camera_cyl" / "demo_data" / "trainval_gt_vis"
 
 out_dataset_dir = Path(os.environ["TARGET_RESULT_DIR"])
@@ -24,6 +24,7 @@ DEFAULT_OUTPUT_ROOT = out_dataset_dir / "data_camera_cyl" / "demo_data" / "train
 DEFAULT_SCENE_SPLIT_PATH = os.path.join(train_val_split_path)
 CAMERA_NAMES = ("front", "right", "left", "back")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
+VIS_SCENE_LIMIT = 2
 
 
 def wrap(angle):
@@ -154,18 +155,11 @@ def split_samples(samples, scene_split_path, val_ratio):
     return fallback_train, fallback_val, "ratio_fallback"
 
 
-def safe_link_or_copy(src_path, dst_path, use_hardlink):
+def safe_copy(src_path, dst_path):
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
 
     if os.path.exists(dst_path):
         os.remove(dst_path)
-
-    if use_hardlink:
-        try:
-            os.link(src_path, dst_path)
-            return
-        except OSError:
-            pass
 
     shutil.copy2(src_path, dst_path)
 
@@ -237,7 +231,7 @@ def build_keypoints(points, width, height):
 
 
 def process_one(args):
-    sample, image_id, output_root, save_vis, use_hardlink = args
+    sample, image_id, output_root, save_vis = args
 
     image = cv2.imread(sample["image_path"])
     if image is None:
@@ -257,8 +251,8 @@ def process_one(args):
     output_image_path = os.path.join(output_root, "images", image_file_name)
     output_calib_path = os.path.join(output_root, "calibs", sample["stem"] + ".txt")
 
-    safe_link_or_copy(sample["image_path"], output_image_path, use_hardlink)
-    safe_link_or_copy(sample["calib_path"], output_calib_path, use_hardlink)
+    safe_copy(sample["image_path"], output_image_path)
+    safe_copy(sample["calib_path"], output_calib_path)
 
     image_info = {
         "file_name": image_file_name,
@@ -439,10 +433,9 @@ def parse_args():
     parser.add_argument("--input_root", default=DEFAULT_INPUT_ROOT, help="Input root like data_camera_cyl/demo_data/trainval_gt_vis")
     parser.add_argument("--output_root", default=DEFAULT_OUTPUT_ROOT, help="Output root like data_camera_cyl/demo_data/trainval")
     parser.add_argument("--scene_split", default=DEFAULT_SCENE_SPLIT_PATH, help="Scene-level train/val split json")
-    parser.add_argument("--workers", type=int, default=10, help="Number of worker processes")
+    parser.add_argument("--workers", type=int, default=6, help="Number of worker processes")
     parser.add_argument("--val_ratio", type=float, default=0.2, help="Fallback val ratio when scene split is unavailable or empty")
     parser.add_argument("--no_vis", action="store_true", help="Disable vis_3d_2d output")
-    parser.add_argument("--no_hardlink", action="store_true", help="Copy files instead of trying hard links first")
     return parser.parse_args()
 
 
@@ -471,17 +464,27 @@ def main():
     input_root = os.path.abspath(args.input_root)
     scene_split_path = os.path.abspath(args.scene_split)
     save_vis = not args.no_vis
-    use_hardlink = not args.no_hardlink
 
     samples = collect_samples(input_root)
     if not samples:
         raise RuntimeError("No valid samples found under {}".format(input_root))
 
+    vis_scene_names = []
+    if save_vis:
+        for sample in samples:
+            scene_name = sample["scene_name"]
+            if scene_name not in vis_scene_names:
+                vis_scene_names.append(scene_name)
+                if len(vis_scene_names) >= VIS_SCENE_LIMIT:
+                    break
+    vis_scene_names = set(vis_scene_names)
+
     train_samples, val_samples, split_mode = split_samples(samples, scene_split_path, args.val_ratio)
 
     tasks = []
     for image_id, sample in enumerate(samples, start=1):
-        tasks.append((sample, image_id, output_root, save_vis, use_hardlink))
+        sample_save_vis = save_vis and sample["scene_name"] in vis_scene_names
+        tasks.append((sample, image_id, output_root, sample_save_vis))
 
     os.makedirs(os.path.join(output_root, "images"), exist_ok=True)
     os.makedirs(os.path.join(output_root, "calibs"), exist_ok=True)
